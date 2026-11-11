@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import auth, health, logs, users
+from app.api import auth, campaigns, dnc, groups, health, logs, mailboxes, settings, users
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 CSRF_HEADER = "x-requested-with"
@@ -18,5 +18,15 @@ async def csrf_guard(request: Request, call_next):
     return await call_next(request)
 
 
-for router in (auth.router, users.router, logs.router, health.router):
+for router in (
+    auth.router,
+    users.router,
+    logs.router,
+    health.router,
+    mailboxes.router,
+    settings.router,
+    groups.router,
+    dnc.router,
+    campaigns.router,
+):
     app.include_router(router, prefix="/api")

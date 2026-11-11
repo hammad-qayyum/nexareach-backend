@@ -33,7 +33,17 @@ Phase 1 has 12 milestones (plan section 24), all launched together at the end.
 
 **Milestone 1, frontend part: done** in nexareach-frontend (app shell, login with 2FA, invites, users, logs, generated API types). The Impeccable polish pass is still to do. When an endpoint changes, regenerate the frontend's types with `npm run gen:api` there.
 
-**Next:** Milestone 2, Mailboxes (add, encrypt credentials, SSL 465 / STARTTLS 587, test connection, ramp-up, do-not-contact, settings).
+**"Send today" slice: done** (cut-down parts of milestones 2, 4, 6 and 7, built ahead of order so campaigns can go out now):
+- Mailboxes: SMTP only (465 SSL / 587 STARTTLS), password encrypted, login test, daily cap, status (ERROR when the server rejects the login). No IMAP, ramp-up or warm-up yet.
+- Settings: email footer (business name, postal address); campaigns can't start without it.
+- Do-not-contact list: emails and whole domains.
+- Lead groups: the browser parses the CSV and posts mapped rows to `POST /api/groups/import`; fixed fields plus `custom` JSONB. An address already in the system keeps its lead and joins the group ("keep old"); the duplicates review screen is still milestone 5.
+- Campaigns: plain-text subject and body with `{{variable|fallback}}` and `{spin|tax}` (`app/services/templates.py`), preview, test send, start/pause/resume/cancel. Start fixes the recipient list and skips do-not-contact and anyone emailed in the last 30 days.
+- Sending engine (`app/services/sending.py`, worker task `send_tick` every minute): per-mailbox pacing (random gap, daily cap counted in UTC days), sending window per campaign timezone, campaigns take turns, 3 retries 15 min apart for temporary errors, the exact text and server reply saved per recipient, `email.sent` / `email.failed` logged.
+- **The worker must run for anything to send.** Sent mail isn't copied to the mailbox's Sent folder yet (needs IMAP), and replies, opt-outs and bounces aren't detected yet: add opt-outs to the do-not-contact list by hand.
+- Local testing: set `SMTP_ALLOW_PLAIN=true` and add a mailbox with security "None", host `localhost`, port `1025`; Mailpit at http://localhost:8025 catches everything.
+
+**Next:** finish milestone 2 (IMAP, ramp-up, settings for API keys), then verification (3).
 
 ## Stack
 

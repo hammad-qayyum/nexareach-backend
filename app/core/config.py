@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     sentry_dsn: str = ""
 
+    # Allow unencrypted SMTP (security NONE). Only for local testing against Mailpit.
+    smtp_allow_plain: bool = False
+
     @property
     def queue_conninfo(self) -> str:
         """Plain libpq URL for Procrastinate (no SQLAlchemy driver suffix)."""
