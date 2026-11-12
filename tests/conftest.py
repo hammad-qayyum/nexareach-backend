@@ -115,3 +115,31 @@ def admin(make_user, login):
     user = make_user("admin@fastnexa.com", role=Role.ADMIN, totp_secret=secret)
     assert login(user.email, secret) == "passed"
     return user
+
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):
+    """No real DNS in tests: domains with "google"/"microsoft" in them are hosted there, others elsewhere."""
+    from app.services import providers
+
+    def mx_hosts(domain: str) -> list[str]:
+        if "nomail" in domain:
+            return []
+        if "google" in domain:
+            return ["aspmx.l.google.com"]
+        if "microsoft" in domain:
+            return [f"{domain.replace('.', '-')}.mail.protection.outlook.com"]
+        return [f"mail.{domain}"]
+
+    monkeypatch.setattr(providers, "mx_hosts", mx_hosts)
+
+
+@pytest.fixture(autouse=True)
+def fake_mail_login(monkeypatch):
+    """No real mail servers in tests: every mailbox login works unless a test says otherwise."""
+    from app.services import mailer
+
+    # Keep the real IMAP check reachable for the test that exercises it against a fake IMAP server.
+    monkeypatch.setattr(mailer, "real_check_imap", mailer.check_imap, raising=False)
+    monkeypatch.setattr(mailer, "check_login", lambda mailbox: None)
+    monkeypatch.setattr(mailer, "check_imap", lambda mailbox: "INBOX.Sent")

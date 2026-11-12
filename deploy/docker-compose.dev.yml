@@ -5,6 +5,8 @@ name: fastnexa-dev
 services:
   db:
     image: postgres:16
+    # Comes back by itself when Docker starts (after a reboot or a crash), with all data in the volume.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: fastnexa
       POSTGRES_PASSWORD: fastnexa
@@ -23,6 +25,7 @@ services:
   mailpit:
     # Fake mail server: catches every email the app sends. Web UI at http://localhost:8025
     image: axllent/mailpit:latest
+    restart: unless-stopped
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"

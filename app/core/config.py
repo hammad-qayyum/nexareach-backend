@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     login_window_minutes: int = 15
 
     sentry_dsn: str = ""
+    # Interactive API docs at /api/docs. Off in production so the API isn't described to the world.
+    api_docs: bool = True
 
     # Allow unencrypted SMTP (security NONE). Only for local testing against Mailpit.
     smtp_allow_plain: bool = False

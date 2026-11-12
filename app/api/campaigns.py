@@ -5,24 +5,29 @@ from zoneinfo import available_timezones
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import Page
 from app.models import (
+    BodyFormat,
     Campaign,
     CampaignRecipient,
     CampaignStatus,
+    EmailProvider,
     Lead,
     LeadGroup,
     Mailbox,
     MailboxStatus,
     RecipientStatus,
+    campaign_exclusions,
     lead_group_members,
 )
 from app.services import mailer, sending
 from app.services.app_settings import get_footer
 from app.services.audit import changes, log_activity, snapshot
+from app.services.email_html import sanitize, to_text
 from app.services.templates import FIXED_FIELDS, compose, footer, lead_fields, variables_used
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
@@ -32,6 +37,8 @@ AUDIT_FIELDS = [
     "status",
     "subject",
     "body",
+    "body_format",
+    "use_lead_timezone",
     "gap_min_seconds",
     "gap_max_seconds",
     "timezone",
@@ -43,6 +50,8 @@ AUDIT_FIELDS = [
 PAUSED_EDITABLE = {
     "subject",
     "body",
+    "body_format",
+    "use_lead_timezone",
     "gap_min_seconds",
     "gap_max_seconds",
     "timezone",
@@ -61,6 +70,7 @@ class Schedule(BaseModel):
     send_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4], min_length=1, max_length=7)
     start_hour: int = Field(default=9, ge=0, le=23)
     end_hour: int = Field(default=17, ge=1, le=24)
+    use_lead_timezone: bool = False
 
     @field_validator("timezone")
     @classmethod
@@ -80,7 +90,8 @@ class Schedule(BaseModel):
 class CampaignIn(Schedule):
     name: str = Field(min_length=1, max_length=200)
     subject: str = Field(default="", max_length=998)
-    body: str = Field(default="", max_length=50_000)
+    body: str = Field(default="", max_length=100_000)
+    body_format: BodyFormat = BodyFormat.TEXT
     group_ids: list[int] = Field(default_factory=list, max_length=100)
     mailbox_ids: list[int] = Field(default_factory=list, max_length=100)
 
@@ -88,9 +99,11 @@ class CampaignIn(Schedule):
 class CampaignUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     subject: str | None = Field(default=None, max_length=998)
-    body: str | None = Field(default=None, max_length=50_000)
+    body: str | None = Field(default=None, max_length=100_000)
+    body_format: BodyFormat | None = None
     group_ids: list[int] | None = Field(default=None, max_length=100)
     mailbox_ids: list[int] | None = Field(default=None, max_length=100)
+    use_lead_timezone: bool | None = None
     gap_min_seconds: int | None = None
     gap_max_seconds: int | None = None
     timezone: str | None = None
@@ -115,6 +128,8 @@ class MailboxRef(BaseModel):
 class Counts(BaseModel):
     total: int = 0
     waiting: int = 0
+    # Being handed to the mail server right now (seconds), or cut off by a crash until recovered.
+    sending: int = 0
     sent: int = 0
     failed: int = 0
     skipped: int = 0
@@ -127,6 +142,7 @@ class CampaignOut(BaseModel):
     status: CampaignStatus
     subject: str
     body: str
+    body_format: BodyFormat
     groups: list[GroupRef]
     mailboxes: list[MailboxRef]
     gap_min_seconds: int
@@ -135,6 +151,9 @@ class CampaignOut(BaseModel):
     send_days: list[int]
     start_hour: int
     end_hour: int
+    use_lead_timezone: bool
+    # Leads in the chosen groups that were unticked before starting.
+    excluded_count: int
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
@@ -156,11 +175,14 @@ class RecipientOut(BaseModel):
     error: str | None
     subject_sent: str | None
     body_sent: str | None
+    html_sent: str | None
+    sent_copy_saved: bool | None
 
 
 class PreviewIn(BaseModel):
     subject: str = Field(default="", max_length=998)
-    body: str = Field(default="", max_length=50_000)
+    body: str = Field(default="", max_length=100_000)
+    body_format: BodyFormat = BodyFormat.TEXT
     group_ids: list[int] = Field(default_factory=list, max_length=100)
     mailbox_id: int | None = None
 
@@ -168,6 +190,27 @@ class PreviewIn(BaseModel):
 class PreviewVersion(BaseModel):
     subject: str
     body: str
+    html: str | None
+
+
+class AudienceLead(BaseModel):
+    id: int
+    email: str
+    name: str | None
+    company: str | None
+    country: str | None
+    timezone: str | None
+    email_provider: EmailProvider | None
+    excluded: bool
+
+
+class ExclusionsIn(BaseModel):
+    lead_ids: list[int] = Field(min_length=1, max_length=5000)
+    excluded: bool
+
+
+class ExclusionsOut(BaseModel):
+    excluded_count: int
 
 
 class PreviewOut(BaseModel):
@@ -201,13 +244,27 @@ def _counts(db: DB, campaign_ids: list[int]) -> dict[int, Counts]:
     return result
 
 
-def _out(c: Campaign, counts: Counts) -> CampaignOut:
+def _excluded(db: DB, campaign_ids: list[int]) -> dict[int, int]:
+    rows = db.execute(
+        select(campaign_exclusions.c.campaign_id, func.count())
+        .where(campaign_exclusions.c.campaign_id.in_(campaign_ids))
+        .group_by(campaign_exclusions.c.campaign_id)
+    )
+    return {cid: n for cid, n in rows}
+
+
+def _full(db: DB, c: Campaign) -> "CampaignOut":
+    return _out(c, _counts(db, [c.id])[c.id], _excluded(db, [c.id]).get(c.id, 0))
+
+
+def _out(c: Campaign, counts: Counts, excluded: int = 0) -> CampaignOut:
     return CampaignOut(
         id=c.id,
         name=c.name,
         status=c.status,
         subject=c.subject,
         body=c.body,
+        body_format=c.body_format,
         groups=[GroupRef(id=g.id, name=g.name) for g in c.groups],
         mailboxes=[
             MailboxRef(
@@ -225,11 +282,18 @@ def _out(c: Campaign, counts: Counts) -> CampaignOut:
         send_days=c.send_days,
         start_hour=c.start_hour,
         end_hour=c.end_hour,
+        use_lead_timezone=c.use_lead_timezone,
+        excluded_count=excluded,
         started_at=c.started_at,
         finished_at=c.finished_at,
         created_at=c.created_at,
         counts=counts,
     )
+
+
+def _has_content(c: Campaign) -> bool:
+    body = to_text(c.body) if c.body_format == BodyFormat.HTML else c.body
+    return bool(c.subject.strip() and body.strip())
 
 
 def _get(db: DB, campaign_id: int) -> Campaign:
@@ -246,6 +310,15 @@ def _load(db: DB, model: type[LeadGroup] | type[Mailbox], ids: list[int], missin
         raise HTTPException(status.HTTP_400_BAD_REQUEST, missing)
     order = {i: n for n, i in enumerate(ids)}
     return sorted(found, key=lambda x: order[x.id])
+
+
+def _usable_mailboxes(db: DB, ids: list[int], already: list[Mailbox]) -> list[Mailbox]:
+    """Load mailboxes for a campaign. Archived ones can't be newly picked (ones already on it may stay)."""
+    mailboxes = _load(db, Mailbox, ids, "mailbox_not_found")
+    kept = {m.id for m in already}
+    if any(m.archived_at is not None and m.id not in kept for m in mailboxes):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "mailbox_archived")
+    return mailboxes
 
 
 def _snapshot(c: Campaign) -> dict[str, Any]:
@@ -294,8 +367,9 @@ def _footer_text(db: DB, sender_name: str) -> str:
 @router.get("", response_model=list[CampaignOut])
 def list_campaigns(db: DB, _: CurrentUser) -> list[CampaignOut]:
     campaigns = db.scalars(select(Campaign).order_by(Campaign.created_at.desc())).all()
-    counts = _counts(db, [c.id for c in campaigns])
-    return [_out(c, counts[c.id]) for c in campaigns]
+    ids = [c.id for c in campaigns]
+    counts, excluded = _counts(db, ids), _excluded(db, ids)
+    return [_out(c, counts[c.id], excluded.get(c.id, 0)) for c in campaigns]
 
 
 @router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
@@ -308,7 +382,9 @@ def create_campaign(body: CampaignIn, db: DB, user: EditorUser, actor: CurrentAc
         name=body.name.strip(),
         status=CampaignStatus.DRAFT,
         subject=body.subject,
-        body=body.body,
+        body=sanitize(body.body) if body.body_format == BodyFormat.HTML else body.body,
+        body_format=body.body_format,
+        use_lead_timezone=body.use_lead_timezone,
         gap_min_seconds=body.gap_min_seconds,
         gap_max_seconds=body.gap_max_seconds,
         timezone=body.timezone,
@@ -317,7 +393,7 @@ def create_campaign(body: CampaignIn, db: DB, user: EditorUser, actor: CurrentAc
         end_hour=body.end_hour,
         created_by_id=user.id,
         groups=_load(db, LeadGroup, body.group_ids, "group_not_found"),
-        mailboxes=_load(db, Mailbox, body.mailbox_ids, "mailbox_not_found"),
+        mailboxes=_usable_mailboxes(db, body.mailbox_ids, already=[]),
     )
     db.add(campaign)
     db.flush()
@@ -342,18 +418,12 @@ def preview(body: PreviewIn, db: DB, _: CurrentUser) -> PreviewOut:
     fields = lead_fields(lead) if lead else {}
     footer_text = _footer_text(db, sender_name)
     rng = random.Random()  # noqa: S311
-    versions = [
-        PreviewVersion(
-            **dict(
-                zip(
-                    ("subject", "body"),
-                    compose(body.subject, body.body, fields, sender_name, footer_text, rng),
-                    strict=True,
-                )
-            )
+    versions = []
+    for _ in range(3):
+        subject, text, html = compose(
+            body.subject, body.body, fields, sender_name, footer_text, rng, body.body_format
         )
-        for _ in range(3)
-    ]
+        versions.append(PreviewVersion(subject=subject, body=text, html=html))
     available = _available_fields(db, body.group_ids)
     unknown = sorted(variables_used(body.subject, body.body) - set(available))
     return PreviewOut(
@@ -367,7 +437,7 @@ def preview(body: PreviewIn, db: DB, _: CurrentUser) -> PreviewOut:
 @router.get("/{campaign_id}", response_model=CampaignOut)
 def get_campaign(campaign_id: int, db: DB, _: CurrentUser) -> CampaignOut:
     campaign = _get(db, campaign_id)
-    return _out(campaign, _counts(db, [campaign.id])[campaign.id])
+    return _full(db, campaign)
 
 
 @router.patch("/{campaign_id}", response_model=CampaignOut)
@@ -395,12 +465,14 @@ def update_campaign(
         campaign.name = body.name.strip()
     if body.subject is not None:
         campaign.subject = body.subject
+    if body.body_format is not None:
+        campaign.body_format = body.body_format
     if body.body is not None:
-        campaign.body = body.body
+        campaign.body = sanitize(body.body) if campaign.body_format == BodyFormat.HTML else body.body
     if body.group_ids is not None:
         campaign.groups = _load(db, LeadGroup, body.group_ids, "group_not_found")
     if body.mailbox_ids is not None:
-        campaign.mailboxes = _load(db, Mailbox, body.mailbox_ids, "mailbox_not_found")
+        campaign.mailboxes = _usable_mailboxes(db, body.mailbox_ids, already=campaign.mailboxes)
     after = _snapshot(campaign)
     if before != after:
         old, new = changes(before, after)
@@ -414,7 +486,7 @@ def update_campaign(
             after=new,
         )
         db.commit()
-    return _out(campaign, _counts(db, [campaign.id])[campaign.id])
+    return _full(db, campaign)
 
 
 @router.post("/{campaign_id}/start", response_model=CampaignOut)
@@ -422,7 +494,7 @@ def start_campaign(campaign_id: int, db: DB, _: EditorUser, actor: CurrentActor)
     campaign = _get(db, campaign_id)
     if campaign.status != CampaignStatus.DRAFT:
         raise HTTPException(status.HTTP_409_CONFLICT, "campaign_not_draft")
-    if not campaign.subject.strip() or not campaign.body.strip():
+    if not _has_content(campaign):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "content_missing")
     if not campaign.groups:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_groups")
@@ -433,7 +505,7 @@ def start_campaign(campaign_id: int, db: DB, _: EditorUser, actor: CurrentActor)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "footer_missing")
     sending.start(db, campaign, actor, sending.now())
     db.commit()
-    return _out(campaign, _counts(db, [campaign.id])[campaign.id])
+    return _full(db, campaign)
 
 
 def _transition(
@@ -467,7 +539,7 @@ def _transition(
         after={"status": to},
     )
     db.commit()
-    return _out(campaign, _counts(db, [campaign.id])[campaign.id])
+    return _full(db, campaign)
 
 
 @router.post("/{campaign_id}/pause", response_model=CampaignOut)
@@ -506,18 +578,19 @@ def send_test(campaign_id: int, body: SendTestIn, db: DB, _: EditorUser, actor: 
     mailbox = db.get(Mailbox, body.mailbox_id) if body.mailbox_id else next(iter(campaign.mailboxes), None)
     if mailbox is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_mailbox")
-    if not campaign.subject.strip() or not campaign.body.strip():
+    if not _has_content(campaign):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "content_missing")
     lead = _sample_lead(db, [g.id for g in campaign.groups])
-    subject, text = compose(
+    subject, text, html = compose(
         campaign.subject,
         campaign.body,
         lead_fields(lead) if lead else {},
         mailbox.display_name,
         _footer_text(db, mailbox.display_name),
         random.Random(),  # noqa: S311
+        campaign.body_format,
     )
-    msg = mailer.build_message(mailbox, str(body.to), f"[Test] {subject}", text)
+    msg = mailer.build_message(mailbox, str(body.to), f"[Test] {subject}", text, html)
     try:
         sent = mailer.send(mailbox, msg)
         result = SendTestOut(ok=True, detail=f"Sent from {mailbox.email}. Server reply: {sent.response}")
@@ -581,7 +654,86 @@ def list_recipients(
             error=r.error,
             subject_sent=r.subject_sent,
             body_sent=r.body_sent,
+            html_sent=r.html_sent,
+            sent_copy_saved=r.sent_copy_saved,
         )
         for r, lead, mailbox_email in rows
     ]
     return Page(items=items, total=total)
+
+
+@router.get("/{campaign_id}/audience", response_model=Page[AudienceLead])
+def list_audience(
+    campaign_id: int,
+    db: DB,
+    _: CurrentUser,
+    q: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Page[AudienceLead]:
+    """The leads the campaign's groups hold now, with whether each has been left out."""
+    campaign = _get(db, campaign_id)
+    group_ids = [g.id for g in campaign.groups]
+    excluded = select(campaign_exclusions.c.lead_id).where(campaign_exclusions.c.campaign_id == campaign.id)
+    query = (
+        select(Lead, Lead.id.in_(excluded))
+        .join(lead_group_members, lead_group_members.c.lead_id == Lead.id)
+        .where(lead_group_members.c.group_id.in_(group_ids))
+        .distinct()
+    )
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.where(
+            or_(Lead.email.ilike(like), Lead.first_name.ilike(like), Lead.company.ilike(like))
+        )
+    total = db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = db.execute(query.order_by(Lead.id).limit(limit).offset(offset))
+    return Page(
+        items=[
+            AudienceLead(
+                id=lead.id,
+                email=lead.email,
+                name=" ".join(p for p in (lead.first_name, lead.last_name) if p) or None,
+                company=lead.company,
+                country=lead.country,
+                timezone=lead.timezone,
+                email_provider=lead.email_provider,
+                excluded=is_excluded,
+            )
+            for lead, is_excluded in rows
+        ],
+        total=total,
+    )
+
+
+@router.put("/{campaign_id}/exclusions", response_model=ExclusionsOut)
+def set_exclusions(
+    campaign_id: int, body: ExclusionsIn, db: DB, _: EditorUser, actor: CurrentActor
+) -> ExclusionsOut:
+    """Leave leads out of (or put them back into) a draft campaign before it starts."""
+    campaign = _get(db, campaign_id)
+    if campaign.status != CampaignStatus.DRAFT:
+        raise HTTPException(status.HTTP_409_CONFLICT, "campaign_not_draft")
+    ids = list(dict.fromkeys(body.lead_ids))
+    if body.excluded:
+        db.execute(
+            insert(campaign_exclusions)
+            .values([{"campaign_id": campaign.id, "lead_id": lid} for lid in ids])
+            .on_conflict_do_nothing()
+        )
+    else:
+        db.execute(
+            delete(campaign_exclusions).where(
+                campaign_exclusions.c.campaign_id == campaign.id, campaign_exclusions.c.lead_id.in_(ids)
+            )
+        )
+    log_activity(
+        db,
+        actor,
+        "campaign.leads_excluded" if body.excluded else "campaign.leads_included",
+        entity_type="campaign",
+        entity_id=campaign.id,
+        after={"lead_ids": ids[:200], "count": len(ids)},
+    )
+    db.commit()
+    return ExclusionsOut(excluded_count=_excluded(db, [campaign.id]).get(campaign.id, 0))

@@ -1,0 +1,106 @@
+# Production: everything on one server behind Caddy (HTTPS).
+#
+#   Both repos side by side:  ~/nexareach/nexareach-backend  and  ~/nexareach/nexareach-frontend
+#   cd ~/nexareach/nexareach-backend/deploy
+#   cp production.env.example production.env   # fill it in
+#   docker compose -f docker-compose.prod.yml --env-file production.env up -d --build
+#
+# Every long-running service restarts by itself after a crash or a reboot (restart: unless-stopped),
+# and all state lives in the database, so sending carries on where it stopped.
+name: nexareach
+
+# One image for the API, the worker and migrations. Only `api` builds it; the others reuse it.
+x-backend: &backend
+  image: nexareach-backend
+  pull_policy: never
+  env_file: production.env
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fastnexa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in production.env}
+      POSTGRES_DB: ${POSTGRES_DB:-fastnexa_outreach}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      retries: 20
+
+  # Applies database migrations, then exits. The API and worker wait for it.
+  migrate:
+    <<: *backend
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    <<: *backend
+    build: ..
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    <<: *backend
+    command: ["python", "-m", "procrastinate", "--app=worker.app.app", "worker"]
+    # Time for an email that is being handed to the mail server to finish before a restart.
+    stop_grace_period: 60s
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  web:
+    build:
+      context: ../../nexareach-frontend
+      args:
+        API_PROXY_TARGET: http://api:8000
+    image: nexareach-frontend
+    restart: unless-stopped
+    depends_on: [api]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in production.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api, web]
+
+  # Nightly encrypted, off-server database backups with restic. See README.md.
+  backup:
+    build: ./backup
+    image: nexareach-backup
+    restart: unless-stopped
+    env_file: production.env
+    environment:
+      PGHOST: db
+    volumes:
+      - backup-cache:/root/.cache/restic
+    depends_on:
+      db: { condition: service_healthy }
+
+  # Uptime monitoring. Only reachable from the server itself; open it through an SSH tunnel.
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - uptime-kuma:/app/data
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:
+  backup-cache:
+  uptime-kuma:

@@ -1,12 +1,34 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import auth, campaigns, dnc, groups, health, logs, mailboxes, settings, users
+from app.api import (
+    auth,
+    campaigns,
+    dnc,
+    duplicates,
+    groups,
+    health,
+    leads,
+    logs,
+    mailboxes,
+    settings,
+    users,
+)
+from app.core.config import get_settings
+from app.core.errors import init_error_tracking
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 CSRF_HEADER = "x-requested-with"
 
-app = FastAPI(title="FastNexa Outreach API", docs_url="/api/docs", openapi_url="/api/openapi.json")
+init_error_tracking("api")
+
+_docs = get_settings().api_docs
+app = FastAPI(
+    title="FastNexa Outreach API",
+    docs_url="/api/docs" if _docs else None,
+    redoc_url=None,
+    openapi_url="/api/openapi.json" if _docs else None,
+)
 
 
 @app.middleware("http")
@@ -26,6 +48,8 @@ for router in (
     mailboxes.router,
     settings.router,
     groups.router,
+    duplicates.router,
+    leads.router,
     dnc.router,
     campaigns.router,
 ):

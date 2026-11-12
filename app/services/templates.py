@@ -6,11 +6,13 @@ Spintax is resolved first (innermost group first, so it can nest), then variable
 is never treated as spintax, so a fallback can contain "|"-free text safely.
 """
 
+import html
 import random
 import re
 from typing import Any
 
 from app.models import Lead
+from app.services.email_html import sanitize, text_to_html, to_text
 
 VARIABLE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*(?:\|([^{}]*))?\}\}")
 # A single-brace group holding at least one "|" and no other braces: the innermost spintax group.
@@ -44,12 +46,13 @@ def spin(text: str, rng: random.Random) -> str:
     return _PLACEHOLDER.sub(lambda m: variables[int(m.group(1))], text)
 
 
-def fill(text: str, fields: dict[str, Any]) -> str:
+def fill(text: str, fields: dict[str, Any], *, escape: bool = False) -> str:
+    """Replace {{variables}}. With escape=True (HTML bodies) values are HTML-escaped first."""
+
     def value(m: re.Match[str]) -> str:
         found = fields.get(m.group(1))
-        if found not in (None, ""):
-            return str(found)
-        return (m.group(2) or "").strip()
+        result = str(found) if found not in (None, "") else (m.group(2) or "").strip()
+        return html.escape(result) if escape else result
 
     return VARIABLE.sub(value, text)
 
@@ -71,10 +74,25 @@ def footer(sender_name: str, business_name: str, postal_address: str) -> str:
 
 
 def compose(
-    subject: str, body: str, fields: dict[str, Any], sender_name: str, footer_text: str, rng: random.Random
-) -> tuple[str, str]:
-    """The final subject and plain-text body for one recipient."""
+    subject: str,
+    body: str,
+    fields: dict[str, Any],
+    sender_name: str,
+    footer_text: str,
+    rng: random.Random,
+    body_format: str = "TEXT",
+) -> tuple[str, str, str | None]:
+    """The final subject, plain-text body and (for rich-text campaigns) HTML body for one recipient.
+
+    Spintax is resolved once, so the HTML and plain-text versions say exactly the same thing.
+    """
     fields = {"sender_name": sender_name, **fields}
     rendered_subject = " ".join(render(subject, fields, rng).split())
-    rendered_body = render(body, fields, rng).rstrip()
-    return rendered_subject, f"{rendered_body}\n\n{footer_text}\n"
+    if body_format != "HTML":
+        rendered_body = render(body, fields, rng).rstrip()
+        return rendered_subject, f"{rendered_body}\n\n{footer_text}\n", None
+
+    body_html = fill(spin(sanitize(body), rng), fields, escape=True)
+    text = f"{to_text(body_html)}\n\n{footer_text}\n"
+    footer_html = text_to_html(footer_text).replace("<p>", '<p style="color:#666;font-size:13px">', 1)
+    return rendered_subject, text, f"{body_html}{footer_html}"

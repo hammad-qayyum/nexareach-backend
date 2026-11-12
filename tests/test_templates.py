@@ -24,7 +24,7 @@ def test_variables_use_values_then_fallbacks():
 
 
 def test_compose_adds_the_footer_and_sender_name():
-    subject, body = compose(
+    subject, body, html = compose(
         "{Quick|Short} question for {{company}}",
         "Hi {{first_name|there}},\n\nThanks,\n{{sender_name}}\n\n",
         {"company": "Acme"},
@@ -35,3 +35,4 @@ def test_compose_adds_the_footer_and_sender_name():
     assert subject in {"Quick question for Acme", "Short question for Acme"}
     assert body.startswith("Hi there,\n\nThanks,\nAli Khan\n\n--\nAli Khan · FastNexa\n1 Main St, Lahore\n")
     assert "reply and I won't email again" in body
+    assert html is None  # plain-text campaign

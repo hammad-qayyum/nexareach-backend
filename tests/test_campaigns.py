@@ -76,20 +76,15 @@ def ready(client, admin):
 
 def test_import_cleans_and_counts_rows(client, ready):
     result = ready["import"]
-    assert (result["added"], result["duplicates_in_file"], result["invalid_count"]) == (3, 1, 1)
+    # SARA@acme.com repeats sara@acme.com: it waits as a pending duplicate instead of joining the group.
+    assert (result["added"], result["pending_duplicates"], result["invalid_count"]) == (3, 1, 1)
     assert result["invalid"] == [{"row": 3, "email": "not-an-email", "reason": "bad_syntax"}]
+    assert result["group"]["pending_count"] == 1
 
     leads = client.get(f"/api/groups/{result['group']['id']}/leads").json()
     assert leads["total"] == 3
     sara = next(lead for lead in leads["items"] if lead["email"] == "sara@acme.com")
     assert sara["custom"] == {"industry": "Logistics"}
-
-    # An address already in the system keeps its lead and joins the new group.
-    again = client.post(
-        "/api/groups/import",
-        json={"name": "Again", "rows": [{"email": "omar@globex.com"}, {"email": "new@x.io"}]},
-    ).json()
-    assert (again["added"], again["existing"]) == (1, 1)
 
 
 def test_mailbox_password_is_never_returned(client, ready):
@@ -127,6 +122,7 @@ def test_start_skips_do_not_contact(client, ready):
     assert r.json()["counts"] == {
         "total": 3,
         "waiting": 2,
+        "sending": 0,
         "sent": 0,
         "failed": 0,
         "skipped": 1,

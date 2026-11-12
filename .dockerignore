@@ -4,3 +4,8 @@ __pycache__
 .ruff_cache
 tests
 *.pyc
+# Never bake secrets or history into the image; production gets its settings from env vars.
+.env
+.env.*
+.git
+deploy

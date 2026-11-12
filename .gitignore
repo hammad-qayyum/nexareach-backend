@@ -40,3 +40,6 @@ playwright-report/
 !deploy/dev/*.sql
 *.dump
 backups/
+
+# Production secrets
+deploy/production.env
