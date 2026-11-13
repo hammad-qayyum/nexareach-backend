@@ -25,3 +25,12 @@ def set_value(db: Session, key: str, value: str, user_id: int | None) -> None:
 
 def get_footer(db: Session) -> tuple[str, str]:
     return get_value(db, FOOTER_BUSINESS_NAME), get_value(db, FOOTER_POSTAL_ADDRESS)
+
+
+BUSINESS_FIELDS = ["business_name", "postal_address"]
+
+
+def business_fields(db: Session) -> dict[str, str]:
+    """{{business_name}} and {{postal_address}} for email templates (from Settings; blank ones left out)."""
+    business_name, postal_address = get_footer(db)
+    return {k: v for k, v in (("business_name", business_name), ("postal_address", postal_address)) if v}

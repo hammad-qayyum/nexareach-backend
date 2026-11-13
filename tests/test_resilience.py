@@ -89,7 +89,7 @@ def test_crash_mid_send_never_emails_anyone_twice(running, db):
     # The attempt was saved before the mail server was contacted.
     assert statuses(db, running["campaign_id"])[0] == ("sara@acme.com", "SENDING")
     recipient = db.scalar(select(CampaignRecipient).where(CampaignRecipient.email == "sara@acme.com"))
-    assert recipient.body_sent.startswith("Hello\n\n--\nAli Khan · FastNexa\n1 Main St\n")
+    assert recipient.body_sent == "Hello\n"
 
     # After the restart the mailbox keeps its pacing and Sara is not picked again.
     smtp = FakeSmtp()

@@ -444,6 +444,8 @@ A task runs every 30 seconds:
 7. Set the mailbox's next free time to now + a random 5–10 min. Update the lead's last-contacted date. Log it.
 8. When no recipients are waiting, the campaign is COMPLETED.
 
+> **Changed 13 Nov 2026 (owner's decision):** no footer is added automatically. An email is exactly the subject and message written; `{{business_name}}` and `{{postal_address}}` (from Settings) can be typed into the message. The compliance rows below now depend on the message text.
+
 **Footer on every email:**
 
 ```

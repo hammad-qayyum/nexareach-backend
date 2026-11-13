@@ -108,10 +108,23 @@ def test_viewers_cannot_change_anything(client, make_user, login):
     assert client.post("/api/campaigns", json={"name": "x"}).status_code == 403
 
 
-def test_start_needs_a_footer(client, ready):
+def test_nothing_is_added_and_business_details_are_optional_fields(client, ready):
+    group_id = ready["import"]["group"]["id"]
+    r = client.post(
+        "/api/campaigns/preview",
+        json={
+            "subject": "Hi",
+            "body": "Thanks\n{{business_name}}, {{postal_address}}",
+            "group_ids": [group_id],
+        },
+    ).json()
+    assert r["versions"][0]["body"] == "Thanks\nFastNexa, 1 Main St, Lahore\n"  # no footer appended
+    assert r["unknown_variables"] == []
+    assert {"business_name", "postal_address"} <= set(r["available_fields"])
+
+    # Business details aren't required to start sending.
     client.put("/api/settings/footer", json={"business_name": "", "postal_address": ""})
-    r = client.post(f"/api/campaigns/{ready['campaign']['id']}/start")
-    assert r.json()["detail"] == "footer_missing"
+    assert client.post(f"/api/campaigns/{ready['campaign']['id']}/start").status_code == 200
 
 
 def test_start_skips_do_not_contact(client, ready):
@@ -141,7 +154,7 @@ def test_sending_paces_each_mailbox(client, ready, db, smtp):
     assert msg["To"] == "sara@acme.com"
     assert msg["Subject"] in {"Quick question for Acme", "Short question for Acme"}
     text = msg.get_content()
-    assert text.startswith("Hi Sara,\n\nWe help Logistics companies.\n\nAli Khan\n\n--\nAli Khan · FastNexa")
+    assert text.rstrip("\n") == "Hi Sara,\n\nWe help Logistics companies.\n\nAli Khan"  # nothing appended
 
     # The next email waits for the gap (5-10 minutes by default).
     assert sending.send_next(db, mailbox_id, TUESDAY_11AM_PKT + timedelta(minutes=4), smtp) == "not_due"
@@ -267,4 +280,4 @@ def test_preview_reports_unknown_variables(client, ready):
     assert len(r["versions"]) == 3
     assert "industry" in r["available_fields"]
     assert r["unknown_variables"] == ["favourite_colour"]
-    assert "Ali Khan · FastNexa" in r["versions"][0]["body"]
+    assert "FastNexa" not in r["versions"][0]["body"]

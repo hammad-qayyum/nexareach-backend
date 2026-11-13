@@ -32,9 +32,9 @@ from app.models import (
     lead_group_members,
 )
 from app.services import mailer, privacy
-from app.services.app_settings import get_footer
+from app.services.app_settings import business_fields
 from app.services.audit import SYSTEM, Actor, log_activity
-from app.services.templates import compose, footer, lead_fields
+from app.services.templates import compose, lead_fields
 
 log = logging.getLogger(__name__)
 
@@ -273,13 +273,11 @@ def send_next(
         return "skipped"
 
     lead = db.get(Lead, recipient.lead_id)
-    business_name, postal_address = get_footer(db)
     subject, body, html = compose(
         campaign.subject,
         campaign.body,
-        lead_fields(lead),
+        {**business_fields(db), **lead_fields(lead)},
         mailbox.display_name,
-        footer(mailbox.display_name, business_name, postal_address),
         rng,
         campaign.body_format,
     )

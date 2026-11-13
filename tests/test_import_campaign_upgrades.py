@@ -147,8 +147,8 @@ def test_rich_text_is_cleaned_and_sent_as_html_plus_text(client, setup, db):
     assert msg.get_content_type() == "multipart/alternative"
     text = msg.get_body(preferencelist=("plain",)).get_content()
     html = msg.get_body(preferencelist=("html",)).get_content()
-    assert text.startswith("Hi Sara, see (https://fastnexa.com)\n\nThanks\n\n--\nAli Khan · FastNexa")
-    assert "<strong>Sara</strong>" in html and "1 Main St, Lahore" in html
+    assert text.rstrip("\n") == "Hi Sara, see (https://fastnexa.com)\n\nThanks"
+    assert "<strong>Sara</strong>" in html and "1 Main St, Lahore" not in html
     recipient = db.scalar(select(CampaignRecipient).where(CampaignRecipient.status == RecipientStatus.SENT))
     assert recipient.html_sent and recipient.body_sent == text
 

@@ -12,7 +12,7 @@ import re
 from typing import Any
 
 from app.models import Lead
-from app.services.email_html import sanitize, text_to_html, to_text
+from app.services.email_html import sanitize, to_text
 
 VARIABLE = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*(?:\|([^{}]*))?\}\}")
 # A single-brace group holding at least one "|" and no other braces: the innermost spintax group.
@@ -65,34 +65,24 @@ def variables_used(*texts: str) -> set[str]:
     return {m.group(1) for t in texts for m in VARIABLE.finditer(t)}
 
 
-def footer(sender_name: str, business_name: str, postal_address: str) -> str:
-    # Plan section 16: real sender, postal address (CAN-SPAM, CASL) and a reply-to-opt-out line.
-    return (
-        f"--\n{sender_name} · {business_name}\n{postal_address}\n"
-        "If this isn't relevant, just reply and I won't email again."
-    )
-
-
 def compose(
     subject: str,
     body: str,
     fields: dict[str, Any],
     sender_name: str,
-    footer_text: str,
     rng: random.Random,
     body_format: str = "TEXT",
 ) -> tuple[str, str, str | None]:
     """The final subject, plain-text body and (for rich-text campaigns) HTML body for one recipient.
 
-    Spintax is resolved once, so the HTML and plain-text versions say exactly the same thing.
+    Spintax is resolved once, so the HTML and plain-text versions say exactly the same thing. Nothing is
+    added to the message: a signature, address or opt-out line goes in the text itself if wanted
+    ({{business_name}} and {{postal_address}} come from Settings).
     """
     fields = {"sender_name": sender_name, **fields}
     rendered_subject = " ".join(render(subject, fields, rng).split())
     if body_format != "HTML":
-        rendered_body = render(body, fields, rng).rstrip()
-        return rendered_subject, f"{rendered_body}\n\n{footer_text}\n", None
+        return rendered_subject, f"{render(body, fields, rng).rstrip()}\n", None
 
     body_html = fill(spin(sanitize(body), rng), fields, escape=True)
-    text = f"{to_text(body_html)}\n\n{footer_text}\n"
-    footer_html = text_to_html(footer_text).replace("<p>", '<p style="color:#666;font-size:13px">', 1)
-    return rendered_subject, text, f"{body_html}{footer_html}"
+    return rendered_subject, f"{to_text(body_html)}\n", body_html

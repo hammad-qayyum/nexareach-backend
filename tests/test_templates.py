@@ -1,6 +1,6 @@
 import random
 
-from app.services.templates import compose, fill, footer, spin, variables_used
+from app.services.templates import compose, fill, spin, variables_used
 
 
 def test_spintax_picks_one_option_and_nests():
@@ -23,16 +23,25 @@ def test_variables_use_values_then_fallbacks():
     assert variables_used(text, "{{industry}}") == {"first_name", "company", "missing", "industry"}
 
 
-def test_compose_adds_the_footer_and_sender_name():
+def test_compose_sends_exactly_the_message_with_sender_name():
     subject, body, html = compose(
         "{Quick|Short} question for {{company}}",
         "Hi {{first_name|there}},\n\nThanks,\n{{sender_name}}\n\n",
         {"company": "Acme"},
         "Ali Khan",
-        footer("Ali Khan", "FastNexa", "1 Main St, Lahore"),
         random.Random(2),
     )
     assert subject in {"Quick question for Acme", "Short question for Acme"}
-    assert body.startswith("Hi there,\n\nThanks,\nAli Khan\n\n--\nAli Khan · FastNexa\n1 Main St, Lahore\n")
-    assert "reply and I won't email again" in body
+    assert body == "Hi there,\n\nThanks,\nAli Khan\n"  # nothing added after the message
     assert html is None  # plain-text campaign
+
+    subject, body, html = compose(
+        "Hi",
+        "<p>Hi <strong>{{first_name}}</strong></p>",
+        {"first_name": "Sara"},
+        "Ali",
+        random.Random(1),
+        "HTML",
+    )
+    assert html == "<p>Hi <strong>Sara</strong></p>"
+    assert body == "Hi Sara\n"

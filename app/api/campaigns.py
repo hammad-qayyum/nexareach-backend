@@ -27,11 +27,11 @@ from app.models import (
     lead_group_members,
 )
 from app.services import mailer, sending
-from app.services.app_settings import get_footer
+from app.services.app_settings import BUSINESS_FIELDS, business_fields
 from app.services.audit import changes, log_activity, snapshot
 from app.services.csv_export import csv_response
 from app.services.email_html import sanitize, to_text
-from app.services.templates import FIXED_FIELDS, compose, footer, lead_fields, variables_used
+from app.services.templates import FIXED_FIELDS, compose, lead_fields, variables_used
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
@@ -359,14 +359,7 @@ def _available_fields(db: DB, group_ids: list[int]) -> list[str]:
         )
         for custom in customs:
             keys.update((custom or {}).keys())
-    return [*FIXED_FIELDS, "sender_name", *sorted(keys)]
-
-
-def _footer_text(db: DB, sender_name: str) -> str:
-    business_name, postal_address = get_footer(db)
-    return footer(
-        sender_name, business_name or "(business name not set)", postal_address or "(address not set)"
-    )
+    return [*FIXED_FIELDS, "sender_name", *BUSINESS_FIELDS, *sorted(keys - set(BUSINESS_FIELDS))]
 
 
 @router.get("", response_model=list[CampaignOut])
@@ -420,14 +413,11 @@ def preview(body: PreviewIn, db: DB, _: CurrentUser) -> PreviewOut:
     lead = _sample_lead(db, body.group_ids)
     mailbox = db.get(Mailbox, body.mailbox_id) if body.mailbox_id else None
     sender_name = mailbox.display_name if mailbox else "Your name"
-    fields = lead_fields(lead) if lead else {}
-    footer_text = _footer_text(db, sender_name)
+    fields = {**business_fields(db), **(lead_fields(lead) if lead else {})}
     rng = random.Random()  # noqa: S311
     versions = []
     for _ in range(3):
-        subject, text, html = compose(
-            body.subject, body.body, fields, sender_name, footer_text, rng, body.body_format
-        )
+        subject, text, html = compose(body.subject, body.body, fields, sender_name, rng, body.body_format)
         versions.append(PreviewVersion(subject=subject, body=text, html=html))
     available = _available_fields(db, body.group_ids)
     unknown = sorted(variables_used(body.subject, body.body) - set(available))
@@ -505,9 +495,6 @@ def start_campaign(campaign_id: int, db: DB, _: EditorUser, actor: CurrentActor)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_groups")
     if not any(m.status == MailboxStatus.ACTIVE for m in campaign.mailboxes):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_active_mailbox")
-    business_name, postal_address = get_footer(db)
-    if not business_name or not postal_address:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "footer_missing")
     sending.start(db, campaign, actor, sending.now())
     db.commit()
     return _full(db, campaign)
@@ -589,9 +576,8 @@ def send_test(campaign_id: int, body: SendTestIn, db: DB, _: EditorUser, actor: 
     subject, text, html = compose(
         campaign.subject,
         campaign.body,
-        lead_fields(lead) if lead else {},
+        {**business_fields(db), **(lead_fields(lead) if lead else {})},
         mailbox.display_name,
-        _footer_text(db, mailbox.display_name),
         random.Random(),  # noqa: S311
         campaign.body_format,
     )
