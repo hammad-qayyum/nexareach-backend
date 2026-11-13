@@ -55,6 +55,9 @@ docker compose -f docker-compose.prod.yml --env-file production.env exec api pyt
 
 Open `https://<your domain>`, sign in and set up 2-step sign-in.
 
+To change someone's sign-in email or password later (for example a forgotten password), run the same
+command with `change-login` instead of `create-admin`. It signs them out everywhere and keeps their 2-step sign-in.
+
 ## 5. Backups
 
 The `backup` service dumps the database every day at `BACKUP_HOUR` (UTC), encrypts it with restic and

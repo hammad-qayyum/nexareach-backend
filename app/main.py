@@ -11,6 +11,8 @@ from app.api import (
     leads,
     logs,
     mailboxes,
+    people,
+    reports,
     settings,
     users,
 )
@@ -52,5 +54,7 @@ for router in (
     leads.router,
     dnc.router,
     campaigns.router,
+    reports.router,
+    people.router,
 ):
     app.include_router(router, prefix="/api")

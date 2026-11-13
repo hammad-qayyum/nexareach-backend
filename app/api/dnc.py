@@ -5,12 +5,13 @@ from typing import Annotated
 from email_validator import EmailNotValidError, validate_email
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import Page
 from app.models import DncKind, DoNotContact
+from app.services import privacy
 from app.services.audit import log_activity
 from app.services.auth import normalize_email
 
@@ -62,7 +63,12 @@ def list_dnc(
 ) -> Page[DncOut]:
     query = select(DoNotContact)
     if q:
-        query = query.where(DoNotContact.value.ilike(f"%{q.strip().lower()}%"))
+        q = q.strip().lower()
+        match = DoNotContact.value.ilike(f"%{q}%")
+        # Forgotten people are listed by a hash of their address: an exact address search finds them.
+        if "@" in q:
+            match = or_(match, DoNotContact.value == privacy.email_hash(q))
+        query = query.where(match)
     total = db.scalar(select(func.count()).select_from(query.subquery()))
     rows = db.scalars(
         query.order_by(DoNotContact.created_at.desc(), DoNotContact.id.desc()).limit(limit).offset(offset)

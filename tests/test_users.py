@@ -101,3 +101,37 @@ def test_reset_2fa(client, admin, make_user):
     r = client.post(f"/api/users/{other.id}/reset-2fa")
     assert r.json()["totp_enabled"] is False
     assert client.post(f"/api/users/{admin.id}/reset-2fa").status_code == 400
+
+
+def test_cli_change_login(client, admin, make_user, db):
+    import pytest
+
+    from app.cli import LoginChangeError, apply_login_change
+
+    make_user("taken@fastnexa.com", role=Role.MEMBER)
+    with pytest.raises(LoginChangeError):
+        apply_login_change(db, "nobody@fastnexa.com", "x@y.com", None)
+    with pytest.raises(LoginChangeError):
+        apply_login_change(db, "admin@fastnexa.com", "taken@fastnexa.com", None)
+    with pytest.raises(LoginChangeError):
+        apply_login_change(db, "admin@fastnexa.com", None, "short")
+
+    apply_login_change(db, "ADMIN@fastnexa.com", " Admin@Nexa.com ", "newpassword987")
+    db.flush()
+
+    # Signed out everywhere; the old email and old password no longer work; 2FA is kept.
+    assert client.get("/api/auth/me").status_code == 401
+    assert (
+        client.post("/api/auth/login", json={"email": "admin@fastnexa.com", "password": PASSWORD}).status_code
+        == 401
+    )
+    assert (
+        client.post("/api/auth/login", json={"email": "admin@nexa.com", "password": PASSWORD}).status_code
+        == 401
+    )
+    r = client.post("/api/auth/login", json={"email": "admin@nexa.com", "password": "newpassword987"})
+    assert r.json() == {"mfa": "verify"}
+
+    entry = db.scalar(select(ActivityLog).where(ActivityLog.action == "user.login_changed_by_cli"))
+    assert entry.before == {"email": "admin@fastnexa.com"}
+    assert entry.after == {"email": "admin@nexa.com", "password_changed": True}

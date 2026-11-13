@@ -1,11 +1,13 @@
 import random
+import re
 from datetime import datetime
 from typing import Annotated, Any
 from zoneinfo import available_timezones
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import Select, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
@@ -27,6 +29,7 @@ from app.models import (
 from app.services import mailer, sending
 from app.services.app_settings import get_footer
 from app.services.audit import changes, log_activity, snapshot
+from app.services.csv_export import csv_response
 from app.services.email_html import sanitize, to_text
 from app.services.templates import FIXED_FIELDS, compose, footer, lead_fields, variables_used
 
@@ -123,6 +126,7 @@ class MailboxRef(BaseModel):
     display_name: str
     status: MailboxStatus
     next_send_at: datetime | None
+    daily_cap: int
 
 
 class Counts(BaseModel):
@@ -273,6 +277,7 @@ def _out(c: Campaign, counts: Counts, excluded: int = 0) -> CampaignOut:
                 display_name=m.display_name,
                 status=m.status,
                 next_send_at=m.next_send_at,
+                daily_cap=m.daily_cap,
             )
             for m in c.mailboxes
         ],
@@ -612,20 +617,13 @@ def send_test(campaign_id: int, body: SendTestIn, db: DB, _: EditorUser, actor: 
     return result
 
 
-@router.get("/{campaign_id}/recipients", response_model=Page[RecipientOut])
-def list_recipients(
-    campaign_id: int,
-    db: DB,
-    _: CurrentUser,
-    status_filter: Annotated[RecipientStatus | None, Query(alias="status")] = None,
-    q: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> Page[RecipientOut]:
-    _get(db, campaign_id)
+FORGOTTEN_LABEL = "Forgotten person"
+
+
+def _recipients_query(campaign_id: int, status_filter: RecipientStatus | None, q: str | None) -> Select:
     query = (
         select(CampaignRecipient, Lead, Mailbox.email)
-        .join(Lead, Lead.id == CampaignRecipient.lead_id)
+        .outerjoin(Lead, Lead.id == CampaignRecipient.lead_id)
         .outerjoin(Mailbox, Mailbox.id == CampaignRecipient.mailbox_id)
         .where(CampaignRecipient.campaign_id == campaign_id)
     )
@@ -636,30 +634,111 @@ def list_recipients(
         query = query.where(
             or_(CampaignRecipient.email.ilike(like), Lead.first_name.ilike(like), Lead.company.ilike(like))
         )
+    return query
+
+
+def _recipient_out(r: CampaignRecipient, lead: Lead | None, mailbox_email: str | None) -> RecipientOut:
+    return RecipientOut(
+        id=r.id,
+        email=r.email if r.lead_id is not None else FORGOTTEN_LABEL,
+        name=(" ".join(p for p in (lead.first_name, lead.last_name) if p) or None) if lead else None,
+        company=lead.company if lead else None,
+        status=r.status,
+        skip_reason=r.skip_reason,
+        mailbox_email=mailbox_email,
+        attempts=r.attempts,
+        next_attempt_at=r.next_attempt_at,
+        sent_at=r.sent_at,
+        smtp_response=r.smtp_response,
+        error=r.error,
+        subject_sent=r.subject_sent,
+        body_sent=r.body_sent,
+        html_sent=r.html_sent,
+        sent_copy_saved=r.sent_copy_saved,
+    )
+
+
+StatusFilter = Annotated[RecipientStatus | None, Query(alias="status")]
+
+
+@router.get("/{campaign_id}/recipients", response_model=Page[RecipientOut])
+def list_recipients(
+    campaign_id: int,
+    db: DB,
+    _: CurrentUser,
+    status_filter: StatusFilter = None,
+    q: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Page[RecipientOut]:
+    _get(db, campaign_id)
+    query = _recipients_query(campaign_id, status_filter, q)
     total = db.scalar(select(func.count()).select_from(query.subquery()))
     rows = db.execute(query.order_by(CampaignRecipient.id).limit(limit).offset(offset))
-    items = [
-        RecipientOut(
-            id=r.id,
-            email=r.email,
-            name=" ".join(p for p in (lead.first_name, lead.last_name) if p) or None,
-            company=lead.company,
-            status=r.status,
-            skip_reason=r.skip_reason,
-            mailbox_email=mailbox_email,
-            attempts=r.attempts,
-            next_attempt_at=r.next_attempt_at,
-            sent_at=r.sent_at,
-            smtp_response=r.smtp_response,
-            error=r.error,
-            subject_sent=r.subject_sent,
-            body_sent=r.body_sent,
-            html_sent=r.html_sent,
-            sent_copy_saved=r.sent_copy_saved,
-        )
-        for r, lead, mailbox_email in rows
+    return Page(items=[_recipient_out(*row) for row in rows], total=total)
+
+
+@router.get("/{campaign_id}/recipients/export")
+def export_recipients(
+    campaign_id: int,
+    db: DB,
+    _: CurrentUser,
+    actor: CurrentActor,
+    status_filter: StatusFilter = None,
+    q: str | None = None,
+) -> StreamingResponse:
+    """The per-lead report as CSV (the current filters apply)."""
+    campaign = _get(db, campaign_id)
+    rows = [
+        _recipient_out(*row)
+        for row in db.execute(_recipients_query(campaign_id, status_filter, q).order_by(CampaignRecipient.id))
     ]
-    return Page(items=items, total=total)
+    log_activity(
+        db,
+        actor,
+        "campaign.recipients_exported",
+        entity_type="campaign",
+        entity_id=campaign.id,
+        after={"status": status_filter, "q": q, "rows": len(rows)},
+    )
+    db.commit()
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "-", campaign.name).strip("-")[:60] or "campaign"
+    return csv_response(
+        f"{safe_name}-recipients-{datetime.now():%Y%m%d-%H%M}.csv",
+        [
+            "email",
+            "name",
+            "company",
+            "status",
+            "skip_reason",
+            "from_mailbox",
+            "attempts",
+            "sent_at",
+            "next_retry_at",
+            "server_reply",
+            "error",
+            "subject",
+            "sent_copy_saved",
+        ],
+        (
+            [
+                r.email,
+                r.name,
+                r.company,
+                r.status.value,
+                r.skip_reason,
+                r.mailbox_email,
+                r.attempts,
+                r.sent_at.isoformat() if r.sent_at else None,
+                r.next_attempt_at.isoformat() if r.next_attempt_at else None,
+                r.smtp_response,
+                r.error,
+                r.subject_sent,
+                None if r.sent_copy_saved is None else ("yes" if r.sent_copy_saved else "no"),
+            ]
+            for r in rows
+        ),
+    )
 
 
 @router.get("/{campaign_id}/audience", response_model=Page[AudienceLead])

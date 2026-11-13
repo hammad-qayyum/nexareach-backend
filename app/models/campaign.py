@@ -114,7 +114,8 @@ class CampaignRecipient(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"))
-    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"))
+    # None once the person was forgotten (GDPR); the row stays, without their address or the text.
+    lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id"))
     email: Mapped[str] = mapped_column(String(320))
     status: Mapped[RecipientStatus] = mapped_column(str_enum(RecipientStatus, "recipient_status"))
     skip_reason: Mapped[str | None] = mapped_column(String(50))

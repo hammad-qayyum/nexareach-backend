@@ -56,7 +56,12 @@ Phase 1 has 12 milestones (plan section 24), all launched together at the end.
 
 **Milestone 12 (launch prep): done, apart from the actual server.** `deploy/docker-compose.prod.yml` (db, migrate, api, worker, web, Caddy, backup, Uptime Kuma; everything `restart: unless-stopped`), `deploy/Caddyfile` (HTTPS, HSTS and security headers, 20 MB body limit), `deploy/backup/` (nightly restic backups plus `restore-test.sh`), `deploy/production.env.example`, and the step-by-step `deploy/README.md`. Error tracking (`SENTRY_DSN`, Sentry or GlitchTip, no personal data) in `app/core/errors.py`. Security review fixes: `.env` kept out of the Docker image, `API_DOCS=false` hides `/api/docs`, CSV export guards against formula injection. Still open: choose the VPS and deploy, and the Impeccable design pass.
 
-**Next:** milestone 8 (replies), then 3 (verification), 2 (ramp-up), 9, 10, 11.
+**Milestone 11 (Reports + compliance): done** (delivered / bounced / replied numbers come with milestones 8 and 10).
+- `GET /api/reports/summary?days=&tz=`: sent and failed per day (days cut in the browser's timezone), per mailbox, per campaign (period counts plus overall progress), and totals (sent, failed, skipped, distinct people reached).
+- `GET /api/campaigns/{id}/recipients/export`: the per-lead report as CSV (same status/search filters), logged as `campaign.recipients_exported`. CSV helpers live in `app/services/csv_export.py` (formula-injection guard).
+- GDPR, in `app/services/privacy.py`, by email: `POST /api/people/export` (Admin/Member) returns a JSON file of every lead copy, group and source, campaign email (with its text), waiting duplicate and do-not-contact entry, logged `person.exported`. `POST /api/people/forget` (Admin only) deletes the leads (memberships and exclusions cascade) and duplicate rows, turns waiting recipients into SKIPPED `forgotten` (finishing the campaign if that was the last one), keeps campaign rows but sets `lead_id` NULL and replaces the address and sent text with nothing but a hash, and puts `forgotten:<HMAC-SHA256 of the address, keyed with ENCRYPTION_KEY>` on do-not-contact (kind EMAIL). Sending, imports (row reason `forgotten`) and add-lead (`person_forgotten`) check that hash; an exact email search of the DNC list finds it. Returns 409 `person_being_emailed` if a send is in flight. The activity log is append-only and keeps its entries; they refer to leads by id, though a few older entries (`lead.created`, `group.lead_pending`, `dnc.added`) include the address.
+
+**Next:** milestone 8 (replies), then 3 (verification), 2 (ramp-up), 9, 10.
 
 ## Stack
 
@@ -71,7 +76,7 @@ app/
   models/     SQLAlchemy models (User, UserSession, UserToken, LoginAttempt, ActivityLog, Setting)
   services/   shared logic used by both API and worker (audit, auth)
   main.py     app setup + CSRF middleware
-  cli.py      create-admin, generate-key
+  cli.py      create-admin, change-login (email/password, logged, signs out), generate-key
 worker/       Procrastinate app and tasks (reuse app/services)
 migrations/   Alembic; files named YYYYMMDD_<rev>_<slug>.py
 tests/        pytest

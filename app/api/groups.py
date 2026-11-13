@@ -19,7 +19,7 @@ from app.models import (
     campaign_groups,
     lead_group_members,
 )
-from app.services import sheets
+from app.services import privacy, sheets
 from app.services.audit import changes, log_activity
 from app.services.auth import normalize_email
 from app.services.geo import timezone_for
@@ -251,6 +251,19 @@ def import_group(body: ImportIn, db: DB, user: EditorUser, actor: CurrentActor) 
             continue
         valid.append((i, normalize_email(raw), row))
 
+    # People who asked to be forgotten (GDPR) can't come back in through an import.
+    forgotten = privacy.forgotten_among(db, list({email for _, email, _ in valid}))
+    if forgotten:
+        kept = []
+        for i, email, row in valid:
+            if email not in forgotten:
+                kept.append((i, email, row))
+                continue
+            invalid_count += 1
+            if len(invalid) < MAX_INVALID_LISTED:
+                invalid.append(InvalidRow(row=i, email=email, reason="forgotten"))
+        valid = kept
+
     if not valid:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_valid_rows")
 
@@ -404,6 +417,8 @@ def add_lead(group_id: int, body: LeadRowIn, db: DB, _: EditorUser, actor: Curre
     except EmailNotValidError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_email") from e
     email = normalize_email(body.email)
+    if privacy.is_forgotten(db, email):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "person_forgotten")
     existing = db.scalar(select(Lead.id).where(Lead.email == email).order_by(Lead.id).limit(1))
     if existing is not None:
         db.add(

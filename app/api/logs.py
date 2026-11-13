@@ -1,5 +1,3 @@
-import csv
-import io
 import json
 from datetime import datetime
 from typing import Annotated
@@ -13,6 +11,7 @@ from app.api.deps import DB, CurrentActor, CurrentUser
 from app.api.schemas import ActivityLogOut, Page
 from app.models import ActivityLog
 from app.services.audit import log_activity
+from app.services.csv_export import csv_response
 
 router = APIRouter(prefix="/logs", tags=["logs"])
 
@@ -72,11 +71,6 @@ def list_actions(db: DB, _: CurrentUser) -> list[str]:
     return list(db.scalars(select(ActivityLog.action).distinct().order_by(ActivityLog.action)))
 
 
-def _cell(value: str) -> str:
-    """Stop spreadsheet apps from running a value as a formula (CSV injection): "=…" becomes "'=…"."""
-    return f"'{value}" if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
-
-
 @router.get("/export")
 def export_logs(db: DB, actor: CurrentActor, filters: Filters) -> StreamingResponse:
     rows = list(
@@ -90,26 +84,21 @@ def export_logs(db: DB, actor: CurrentActor, filters: Filters) -> StreamingRespo
     )
     db.commit()
 
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["id", "time", "actor", "action", "entity_type", "entity_id", "before", "after", "ip"])
-    for r in rows:
-        writer.writerow(
+    return csv_response(
+        f"activity-log-{datetime.now():%Y%m%d-%H%M}.csv",
+        ["id", "time", "actor", "action", "entity_type", "entity_id", "before", "after", "ip"],
+        (
             [
                 r.id,
                 r.created_at.isoformat(),
-                _cell(r.actor_label),
-                _cell(r.action),
-                _cell(r.entity_type or ""),
-                _cell(r.entity_id or ""),
-                _cell(json.dumps(r.before)) if r.before is not None else "",
-                _cell(json.dumps(r.after)) if r.after is not None else "",
-                _cell(r.ip or ""),
+                r.actor_label,
+                r.action,
+                r.entity_type,
+                r.entity_id,
+                json.dumps(r.before) if r.before is not None else None,
+                json.dumps(r.after) if r.after is not None else None,
+                r.ip,
             ]
-        )
-    filename = f"activity-log-{datetime.now():%Y%m%d-%H%M}.csv"
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            for r in rows
+        ),
     )

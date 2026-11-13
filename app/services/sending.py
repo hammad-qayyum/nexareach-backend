@@ -31,7 +31,7 @@ from app.models import (
     campaign_mailboxes,
     lead_group_members,
 )
-from app.services import mailer
+from app.services import mailer, privacy
 from app.services.app_settings import get_footer
 from app.services.audit import SYSTEM, Actor, log_activity
 from app.services.templates import compose, footer, lead_fields
@@ -79,7 +79,8 @@ def blocked_reason(db: Session, email: str, campaign_id: int, at: datetime) -> s
     dnc = db.scalar(
         select(DoNotContact.id).where(
             or_(
-                (DoNotContact.kind == DncKind.EMAIL) & (DoNotContact.value == email),
+                (DoNotContact.kind == DncKind.EMAIL)
+                & (DoNotContact.value.in_([email, privacy.email_hash(email)])),
                 (DoNotContact.kind == DncKind.DOMAIN) & (DoNotContact.value == _domain(email)),
             )
         )
@@ -127,7 +128,11 @@ def start(db: Session, campaign: Campaign, actor: Actor, at: datetime) -> dict[s
     counts = {"waiting": 0, "skipped": 0}
     for lead in leads:
         reason = None
-        if lead.email in dnc_emails or _domain(lead.email) in dnc_domains:
+        if (
+            lead.email in dnc_emails
+            or _domain(lead.email) in dnc_domains
+            or privacy.email_hash(lead.email) in dnc_emails
+        ):
             reason = "do_not_contact"
         elif lead.email in recent:
             reason = "contacted_recently"
