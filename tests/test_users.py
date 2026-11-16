@@ -135,3 +135,11 @@ def test_cli_change_login(client, admin, make_user, db):
     entry = db.scalar(select(ActivityLog).where(ActivityLog.action == "user.login_changed_by_cli"))
     assert entry.before == {"email": "admin@fastnexa.com"}
     assert entry.after == {"email": "admin@nexa.com", "password_changed": True}
+
+
+def test_invite_link_uses_app_base_url(client, admin, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "app_base_url", "https://outreach.example.com/")
+    r = client.post("/api/users/invite", json={"name": "Ana", "email": "ana@fastnexa.com", "role": "MEMBER"})
+    assert r.json()["invite_url"].startswith("https://outreach.example.com/invite/")  # no "//invite"

@@ -281,3 +281,14 @@ def test_preview_reports_unknown_variables(client, ready):
     assert "industry" in r["available_fields"]
     assert r["unknown_variables"] == ["favourite_colour"]
     assert "FastNexa" not in r["versions"][0]["body"]
+
+
+def test_development_copy_only_sends_through_mailpit(client, ready, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "app_env", "development")
+    # The campaign's mailbox points at the real mail server: refused before anything is sent.
+    r = client.post(f"/api/campaigns/{ready['campaign']['id']}/start")
+    assert r.status_code == 400 and r.json()["detail"] == "dev_real_mailbox"
+    r = client.post(f"/api/campaigns/{ready['campaign']['id']}/test-send", json={"to": "me@example.com"})
+    assert r.json()["ok"] is False and "only sends through Mailpit" in r.json()["detail"]

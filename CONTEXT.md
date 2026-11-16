@@ -76,7 +76,7 @@ app/
   models/     SQLAlchemy models (User, UserSession, UserToken, LoginAttempt, ActivityLog, Setting)
   services/   shared logic used by both API and worker (audit, auth)
   main.py     app setup + CSRF middleware
-  cli.py      create-admin, change-login (email/password, logged, signs out), generate-key
+  cli.py      create-admin, change-login (email/password, logged, signs out), generate-key, seed-dev, reset-dev
 worker/       Procrastinate app and tasks (reuse app/services)
 migrations/   Alembic; files named YYYYMMDD_<rev>_<slug>.py
 tests/        pytest
@@ -97,17 +97,38 @@ docs/         Phase1-Plan.md
 - **Style:** ruff, line length 110, target py312. Comments are sparse and explain why, not what.
 - **Deliberate product choices:** no open or click tracking, no unsubscribe link (opt-out is "reply and I won't email again", handled automatically), sending only from fastnexa.com.
 
+## Environments
+
+Production is live (deployed Nov 2026). Two copies, kept apart:
+
+| | Development (laptop) | Production (server) |
+|---|---|---|
+| Branch | `develop` (and short branches off it) | `main` only; the server runs `git pull` of `main` |
+| Settings | `.env` from `.env.example`, `APP_ENV=development` | `deploy/production.env`, `APP_ENV=production` |
+| Database | Docker on port 5433, sample data from `reset-dev` | Docker on the server, real data |
+| Email | Mailpit only: `mailer.development_block` refuses any non-local SMTP host, and starting a campaign with one returns 400 `dev_real_mailbox` | real mailboxes |
+| Secrets | its own `ENCRYPTION_KEY` | production key, never on a laptop |
+
+Rules: never copy the production database to a laptop; merge `develop` into `main` only when GitHub CI
+(`.github/workflows/ci.yml`: ruff + pytest against Postgres) is green; take a backup before each deploy.
+`APP_ENV` defaults to `production`, so a server without it set behaves as before. `/api/auth/me` returns
+`environment`; the frontend shows a Development badge. Sentry events are tagged with the environment.
+Development-only CLI: `seed-dev` (empty database → dev@example.com / member@ / viewer@, password
+`devpassword123`; two Mailpit mailboxes; real-estate sample leads on example.com; two do-not-contact
+entries) and `reset-dev` (drops the schema, runs migrations, seeds; asks you to type the database name).
+Both refuse unless `APP_ENV=development` and the database host is localhost.
+
 ## Local development
 
 Requires Docker Desktop and Python 3.12 (`python3.12`, not conda's `python3`, which is 3.14). Run everything from the repo root.
 
 ```bash
 docker compose -f deploy/docker-compose.dev.yml up -d
+cp .env.example .env            # then put a new key from `app.cli generate-key` in ENCRYPTION_KEY
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/alembic upgrade head
-.venv/bin/python -m app.cli create-admin
-.venv/bin/uvicorn app.main:app --reload --port 8000
+.venv/bin/python -m app.cli reset-dev
+.venv/bin/python -m uvicorn app.main:app --reload --port 8000
 .venv/bin/python -m procrastinate --app=worker.app.app worker
 ```
 
@@ -120,7 +141,7 @@ Tests and lint:
 ```
 Tests need the dev Postgres running. They use the `fastnexa_test` database on port 5433, rebuild the schema once per run, and wrap each test in a transaction that is rolled back.
 
-**Configuration:** copy `.env.example` to `.env` in the repo root and fill it in; never commit `.env`. Generate `ENCRYPTION_KEY` with `.venv/bin/python -m app.cli generate-key`.
+**Configuration:** `.env.example` is the development template (copy to `.env`, never commit it). Server settings live in `deploy/production.env` (template `deploy/production.env.example`).
 
 ## Known gaps
 

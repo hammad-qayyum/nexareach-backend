@@ -142,4 +142,4 @@ def find_invite(db: Session, token: str) -> UserToken | None:
 
 
 def invite_url(token: str) -> str:
-    return f"{get_settings().app_base_url}/invite/{token}"
+    return f"{get_settings().app_base_url.rstrip('/')}/invite/{token}"
