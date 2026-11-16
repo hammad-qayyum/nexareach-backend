@@ -8,6 +8,8 @@ os.environ["DATABASE_URL"] = os.environ.get(
 )
 os.environ["ENCRYPTION_KEY"] = base64.b64encode(b"k" * 32).decode()
 os.environ["APP_BASE_URL"] = "http://testserver"
+# Not "development": tests use fake mail servers on made-up hosts.
+os.environ["APP_ENV"] = "test"
 
 from collections.abc import Iterator  # noqa: E402
 

@@ -110,6 +110,9 @@ Then browse to <http://localhost:3001>, create the admin account and add:
 
 ## 7. Updating
 
+The server only ever runs the `main` branch. Day-to-day work happens on `develop` (on a laptop, see the
+main README); merge `develop` into `main` when GitHub's CI check is green, then:
+
 ```bash
 cd ~/nexareach/nexareach-backend && git pull
 cd ../nexareach-frontend && git pull
@@ -132,7 +135,8 @@ hand (`docker stop` or `docker kill`) is the exception: it stays stopped until y
 - Only Caddy is reachable from the internet; Postgres, the API and the web app sit on Docker's internal
   network. Uptime Kuma is bound to 127.0.0.1.
 - HTTPS everywhere with HSTS, clickjacking protection and other security headers (see `Caddyfile`).
-- `COOKIE_SECURE=true` and `API_DOCS=false` in production.
+- `APP_ENV=production`, `COOKIE_SECURE=true` and `API_DOCS=false` in production. Never set
+  `SMTP_ALLOW_PLAIN` here, and never copy this database or `production.env` to a laptop.
 - Admins must use 2-step sign-in; logins are rate limited; mailbox passwords, TOTP secrets and other
   secrets are AES-GCM encrypted with `ENCRYPTION_KEY`; the activity log can't be edited.
 - `production.env` is git-ignored and never copied into an image.

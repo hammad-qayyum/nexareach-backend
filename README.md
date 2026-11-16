@@ -50,29 +50,39 @@ See section 24 of the plan for what each milestone contains.
 Copy `.env.example` to `.env` and fill in the values. Never commit `.env`.
 Generate an encryption key with `python -m app.cli generate-key` (from `backend/`).
 
-## Local development
+## Development environment
 
-Requires Docker Desktop and Python 3.12.
+Two copies of NexaReach exist: **production** (the server, `main` branch, real email) and
+**development** (your laptop, `develop` branch, email only goes to Mailpit). See CONTEXT.md for the rules.
+
+Requires Docker Desktop and Python 3.12. Run everything from this folder.
 
 ```bash
 # 1. Database (port 5433) and Mailpit fake mail server (web UI at http://localhost:8025)
 docker compose -f deploy/docker-compose.dev.yml up -d
 
-# 2. Backend setup (once)
-cd backend
+# 2. Settings (once): copy the template, then put a NEW key in ENCRYPTION_KEY
+cp .env.example .env
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/alembic upgrade head
-.venv/bin/python -m app.cli create-admin
+.venv/bin/python -m app.cli generate-key
 
-# 3. Run the API (docs at http://localhost:8000/api/docs) and the worker, in two terminals
-.venv/bin/uvicorn app.main:app --reload --port 8000
+# 3. Database with sample data: users, two Mailpit mailboxes, real-estate leads (also: start over any time)
+.venv/bin/python -m app.cli reset-dev
+
+# 4. Run the API (docs at http://localhost:8000/api/docs) and the worker, in two terminals
+.venv/bin/python -m uvicorn app.main:app --reload --port 8000
 .venv/bin/python -m procrastinate --app=worker.app.app worker
 
-# Tests and lint
-.venv/bin/pytest
+# Tests and lint (GitHub runs the same on every push to develop or main)
+.venv/bin/python -m pytest
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-New database tables: change the models in `backend/app/models/`, then
-`.venv/bin/alembic revision --autogenerate -m "describe change"` and review the generated file.
+Sign in at http://localhost:3000 as `dev@example.com` / `devpassword123` (admin), or `member@example.com`
+/ `viewer@example.com` with the same password. With `APP_ENV=development` the app shows a
+**Development** badge and refuses to send through any mailbox that isn't Mailpit (`localhost`).
+
+New database tables: change the models in `app/models/`, then
+`.venv/bin/python -m alembic revision --autogenerate -m "describe change"`, review the generated file and
+test it with `reset-dev`. Production applies it on the next deploy.

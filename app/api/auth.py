@@ -37,6 +37,8 @@ class LoginOut(BaseModel):
 class MeOut(BaseModel):
     user: UserOut
     mfa: MfaState
+    # "development" or "production", so the app can show which copy you're in.
+    environment: str
 
 
 class CodeIn(BaseModel):
@@ -126,7 +128,9 @@ def logout(request: Request, response: Response, db: DB) -> None:
 
 @router.get("/me", response_model=MeOut)
 def me(session: CurrentSession) -> MeOut:
-    return MeOut(user=UserOut.model_validate(session.user), mfa=_mfa_state(session))
+    return MeOut(
+        user=UserOut.model_validate(session.user), mfa=_mfa_state(session), environment=get_settings().app_env
+    )
 
 
 @router.post("/2fa/setup", response_model=TotpSetupOut)

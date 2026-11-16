@@ -40,6 +40,20 @@ class Sent:
     response: str
 
 
+# Mail servers that only exist on this machine (Mailpit). A development copy may only send through these.
+LOCAL_SMTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "mailpit", "host.docker.internal"})
+
+
+def development_block(mailbox: Mailbox) -> str | None:
+    """Why this mailbox may not send here, or None. Only applies when APP_ENV=development."""
+    if not get_settings().is_development or mailbox.smtp_host.strip().lower() in LOCAL_SMTP_HOSTS:
+        return None
+    return (
+        f"This is a development copy (APP_ENV=development), so it only sends through Mailpit. "
+        f"{mailbox.email} uses the real mail server {mailbox.smtp_host}."
+    )
+
+
 def _connect(mailbox: Mailbox) -> smtplib.SMTP:
     # Mozilla's CA list from certifi, so TLS checks don't depend on the machine's own store
     # (python.org builds on macOS ship without one).
@@ -216,6 +230,8 @@ def save_sent_copy(mailbox: Mailbox, msg: EmailMessage) -> str:
 
 def send(mailbox: Mailbox, msg: EmailMessage) -> Sent:
     """Send one message. Raises AuthFailed or SendFailed (with .temporary and .uncertain)."""
+    if reason := development_block(mailbox):
+        raise SendFailed(reason, temporary=False)
     to = msg["To"]
     handing_over = False
     try:

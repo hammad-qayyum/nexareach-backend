@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     # 32 random bytes, base64. Encrypts mailbox passwords, tokens, API keys and TOTP secrets.
     encryption_key: str = ""
 
+    # "development" on a laptop, "production" on the server. A development copy only sends email
+    # through Mailpit (see mailer.development_block), so it can never email real people.
+    app_env: str = "production"
+
     app_base_url: str = "http://localhost:3000"
     cookie_secure: bool = False
     session_idle_hours: int = 12
@@ -30,6 +34,10 @@ class Settings(BaseSettings):
 
     # Allow unencrypted SMTP (security NONE). Only for local testing against Mailpit.
     smtp_allow_plain: bool = False
+
+    @property
+    def is_development(self) -> bool:
+        return self.app_env.strip().lower() == "development"
 
     @property
     def queue_conninfo(self) -> str:

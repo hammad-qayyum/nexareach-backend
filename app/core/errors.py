@@ -15,4 +15,5 @@ def init_error_tracking(component: str) -> None:
         send_default_pii=False,
         traces_sample_rate=0,
         server_name=component,
+        environment=get_settings().app_env,
     )

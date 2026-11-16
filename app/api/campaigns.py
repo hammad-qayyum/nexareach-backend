@@ -495,6 +495,8 @@ def start_campaign(campaign_id: int, db: DB, _: EditorUser, actor: CurrentActor)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_groups")
     if not any(m.status == MailboxStatus.ACTIVE for m in campaign.mailboxes):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_active_mailbox")
+    if any(mailer.development_block(m) for m in campaign.mailboxes):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "dev_real_mailbox")
     sending.start(db, campaign, actor, sending.now())
     db.commit()
     return _full(db, campaign)
