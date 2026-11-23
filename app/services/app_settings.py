@@ -34,3 +34,20 @@ def business_fields(db: Session) -> dict[str, str]:
     """{{business_name}} and {{postal_address}} for email templates (from Settings; blank ones left out)."""
     business_name, postal_address = get_footer(db)
     return {k: v for k, v in (("business_name", business_name), ("postal_address", postal_address)) if v}
+
+
+def get_json(db: Session, key: str) -> dict:
+    """A setting stored as a JSON object ({} when unset)."""
+    value = db.scalar(select(Setting.value).where(Setting.key == key))
+    return value if isinstance(value, dict) else {}
+
+
+def set_json(db: Session, key: str, value: dict, user_id: int | None, *, secret: bool = False) -> None:
+    """Secret parts must already be encrypted by the caller (field names ending in _encrypted)."""
+    db.execute(
+        insert(Setting)
+        .values(key=key, value=value, is_secret=secret, updated_by_id=user_id)
+        .on_conflict_do_update(
+            index_elements=[Setting.key], set_={"value": value, "is_secret": secret, "updated_by_id": user_id}
+        )
+    )

@@ -6,6 +6,7 @@ from app.api.deps import DB, AdminUser, CurrentActor
 from app.api.schemas import UserOut
 from app.models import Role, User, UserStatus
 from app.services import auth as auth_service
+from app.services import invites
 from app.services.audit import changes, log_activity, snapshot
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -22,6 +23,9 @@ class InviteIn(BaseModel):
 class InviteOut(BaseModel):
     user: UserOut
     invite_url: str
+    # Whether the link was emailed: None when no invite mailbox is set up in Settings.
+    email_sent: bool | None = None
+    email_detail: str | None = None
 
 
 class UserUpdateIn(BaseModel):
@@ -32,6 +36,8 @@ class UserUpdateIn(BaseModel):
 
 class InviteLinkOut(BaseModel):
     invite_url: str
+    email_sent: bool | None = None
+    email_detail: str | None = None
 
 
 @router.get("", response_model=list[UserOut])
@@ -54,7 +60,9 @@ def invite_user(body: InviteIn, db: DB, admin: AdminUser, actor: CurrentActor) -
         db, actor, "user.invited", entity_type="user", entity_id=user.id, after=snapshot(user, AUDIT_FIELDS)
     )
     db.commit()
-    return InviteOut(user=UserOut.model_validate(user), invite_url=auth_service.invite_url(token))
+    url = auth_service.invite_url(token)
+    sent, detail = _email_invite(db, user, admin, actor, url)
+    return InviteOut(user=UserOut.model_validate(user), invite_url=url, email_sent=sent, email_detail=detail)
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -95,7 +103,27 @@ def resend_invite(user_id: int, db: DB, admin: AdminUser, actor: CurrentActor) -
     token = auth_service.create_invite_token(db, user, admin)
     log_activity(db, actor, "user.invite_resent", entity_type="user", entity_id=user.id)
     db.commit()
-    return InviteLinkOut(invite_url=auth_service.invite_url(token))
+    url = auth_service.invite_url(token)
+    sent, detail = _email_invite(db, user, admin, actor, url)
+    return InviteLinkOut(invite_url=url, email_sent=sent, email_detail=detail)
+
+
+def _email_invite(
+    db: DB, user: User, admin: User, actor: CurrentActor, url: str
+) -> tuple[bool | None, str | None]:
+    """After the invite is saved, so a mail problem never loses it: the link is shown either way."""
+    sent, detail = invites.email_invite(db, user, admin, url)
+    if sent is not None:
+        log_activity(
+            db,
+            actor,
+            "user.invite_emailed" if sent else "user.invite_email_failed",
+            entity_type="user",
+            entity_id=user.id,
+            after={"detail": detail},
+        )
+        db.commit()
+    return sent, detail
 
 
 @router.post("/{user_id}/reset-2fa", response_model=UserOut)

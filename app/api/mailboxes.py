@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -16,7 +16,7 @@ from app.models import (
     SmtpSecurity,
     campaign_mailboxes,
 )
-from app.services import mailer
+from app.services import alerts, mailer, warmup
 from app.services.audit import changes, log_activity, snapshot
 from app.services.auth import normalize_email
 from app.services.sending import now, sent_today
@@ -35,6 +35,9 @@ AUDIT_FIELDS = [
     "imap_port",
     "daily_cap",
     "status",
+    "ramp_up_enabled",
+    "ramp_start_limit",
+    "warmup_enabled",
 ]
 
 
@@ -54,7 +57,21 @@ class MailboxOut(BaseModel):
     imap_host: str | None
     imap_port: int
     sent_folder: str | None
+    # Reply checking (every 5 minutes, needs IMAP): when the inbox was last read, and what went wrong.
+    inbox_checked_at: datetime | None
+    inbox_error: str | None
     daily_cap: int
+    # Ramp-up: today's limit (campaigns and warm-up together), and which ramp-up day it is (None = done/off).
+    daily_limit_today: int
+    ramp_up_enabled: bool
+    ramp_start_date: date | None
+    ramp_start_limit: int
+    ramp_day: int | None
+    warmup_enabled: bool
+    # Campaign emails from this mailbox are paused (warm-up carries on), and why: an alert kind
+    # (app.services.alerts.KINDS: "warmup_low", "hard_bounces", "blacklisted", "dns_broken").
+    campaigns_paused_at: datetime | None
+    campaigns_paused_reason: str | None
     status: MailboxStatus
     last_error: str | None
     next_send_at: datetime | None
@@ -80,6 +97,10 @@ class MailboxIn(BaseModel):
     imap_host: str | None = Field(default=None, max_length=255)
     imap_port: int = Field(default=993, ge=1, le=65535)
     daily_cap: int = Field(default=40, ge=1, le=500)
+    # A new mailbox starts slowly; turn off for one that has been sending for a while.
+    ramp_up_enabled: bool = True
+    ramp_start_limit: int = Field(default=5, ge=1, le=500)
+    warmup_enabled: bool = False
 
 
 class MailboxUpdateIn(BaseModel):
@@ -94,6 +115,10 @@ class MailboxUpdateIn(BaseModel):
     imap_port: int | None = Field(default=None, ge=1, le=65535)
     daily_cap: int | None = Field(default=None, ge=1, le=500)
     status: MailboxStatus | None = None
+    # Turning ramp-up on (again) starts it from today.
+    ramp_up_enabled: bool | None = None
+    ramp_start_limit: int | None = Field(default=None, ge=1, le=500)
+    warmup_enabled: bool | None = None
 
 
 def _out(db: DB, m: Mailbox, connection: CheckOut | None = None) -> MailboxOut:
@@ -107,8 +132,18 @@ def _out(db: DB, m: Mailbox, connection: CheckOut | None = None) -> MailboxOut:
         smtp_username=m.smtp_username,
         imap_host=m.imap_host,
         imap_port=m.imap_port,
+        inbox_checked_at=m.inbox_checked_at,
+        inbox_error=m.inbox_error,
         sent_folder=m.sent_folder,
         daily_cap=m.daily_cap,
+        daily_limit_today=warmup.daily_limit(m, now().date()),
+        ramp_up_enabled=m.ramp_up_enabled,
+        ramp_start_date=m.ramp_start_date,
+        ramp_start_limit=m.ramp_start_limit,
+        ramp_day=warmup.ramp_day(m, now().date()),
+        warmup_enabled=m.warmup_enabled,
+        campaigns_paused_at=m.campaigns_paused_at,
+        campaigns_paused_reason=m.campaigns_paused_reason,
         status=m.status,
         last_error=m.last_error,
         next_send_at=m.next_send_at,
@@ -172,6 +207,10 @@ def create_mailbox(body: MailboxIn, db: DB, user: EditorUser, actor: CurrentActo
         imap_host=(body.imap_host or "").strip() or None,
         imap_port=body.imap_port,
         daily_cap=body.daily_cap,
+        ramp_up_enabled=body.ramp_up_enabled,
+        ramp_start_date=now().date() if body.ramp_up_enabled else None,
+        ramp_start_limit=body.ramp_start_limit,
+        warmup_enabled=body.warmup_enabled,
         # Never active before its login has been tested (just below).
         status=MailboxStatus.ERROR,
         last_error="Connection not tested yet.",
@@ -208,12 +247,20 @@ def update_mailbox(
     if "imap_host" in body.model_fields_set:
         new_host = (body.imap_host or "").strip() or None
         if new_host != mailbox.imap_host:
-            mailbox.sent_folder = None  # look it up again on the new server
+            # Another server: find its Sent folder again, and read its inbox from the start.
+            mailbox.sent_folder = None
+            mailbox.inbox_uidvalidity = mailbox.inbox_last_uid = None
+            mailbox.inbox_error = None
         mailbox.imap_host = new_host
-    for field in ["smtp_port", "smtp_security", "imap_port", "daily_cap", "status"]:
+    for field in ["smtp_port", "smtp_security", "imap_port", "daily_cap", "status", "ramp_start_limit"]:
         value = getattr(body, field)
         if value is not None:
             setattr(mailbox, field, value)
+    if body.ramp_up_enabled is not None and body.ramp_up_enabled != mailbox.ramp_up_enabled:
+        mailbox.ramp_up_enabled = body.ramp_up_enabled
+        mailbox.ramp_start_date = now().date() if body.ramp_up_enabled else None
+    if body.warmup_enabled is not None:
+        mailbox.warmup_enabled = body.warmup_enabled
     password_changed = body.smtp_password is not None
     if password_changed:
         mailbox.smtp_password_encrypted = encrypt(body.smtp_password)
@@ -347,3 +394,13 @@ def _test_and_set_status(db: DB, mailbox: Mailbox, actor: CurrentActor) -> Check
     )
     db.commit()
     return result
+
+
+@router.post("/{mailbox_id}/resume-campaigns", response_model=MailboxOut)
+def resume_campaigns(mailbox_id: int, db: DB, _: EditorUser, actor: CurrentActor) -> MailboxOut:
+    """Let campaign emails go out from this mailbox again after they were paused (an alert: low inbox rate,
+    hard bounces, a blacklist...). Acknowledges the alerts that paused it."""
+    mailbox = _get(db, mailbox_id)
+    if alerts.resume_mailbox(db, mailbox, actor, now()):
+        db.commit()
+    return _out(db, mailbox)

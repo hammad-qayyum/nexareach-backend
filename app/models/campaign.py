@@ -1,5 +1,6 @@
 import enum
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -81,6 +83,12 @@ class Campaign(TimestampMixin, Base):
     end_hour: Mapped[int] = mapped_column(Integer)
     # Apply the days/hours window in each lead's own timezone (falls back to `timezone` when unknown).
     use_lead_timezone: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Follow-up emails, in order: [{"delay_days": 3, "body": "plain text"}]. Each goes out delay_days after
+    # the previous email to that person, from the same mailbox, as a reply in the same thread, and they
+    # stop as soon as the person replies, bounces or opts out (see app.services.sending and replies).
+    follow_ups: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, server_default="[]")
+    # Follow-ups are optional: switched off, the steps above are kept but nothing is sent.
+    follow_ups_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -134,6 +142,55 @@ class CampaignRecipient(Base):
     html_sent: Mapped[str | None] = mapped_column(Text)
     # Copy in the mailbox's Sent folder: None = not attempted (no IMAP set up), True/False = result.
     sent_copy_saved: Mapped[bool | None] = mapped_column(Boolean)
+    # Follow-ups: how many went out, and when the next one is due (None = none planned).
+    follow_ups_sent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # When the person answered (found in the mailbox's inbox, or marked by hand).
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Why follow-ups stopped early: replied, opted_out, bounced, do_not_contact, failed, cancelled, forgotten.
+    follow_up_stop: Mapped[str | None] = mapped_column(String(50))
+    # What happened after it left (app.services.delivery): None until something is known beyond "sent".
+    delivery_status: Mapped[str | None] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class FollowUpStatus(enum.StrEnum):
+    # Committed before the mail server is contacted, like RecipientStatus.SENDING.
+    SENDING = "SENDING"
+    # A temporary error: tried again after recipient.next_follow_up_at.
+    WAITING = "WAITING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
+class FollowUpEmail(Base):
+    """One follow-up email to one recipient (step 1 is the first follow-up after the opening email)."""
+
+    __tablename__ = "follow_up_emails"
+    __table_args__ = (
+        UniqueConstraint("recipient_id", "step", name="uq_follow_up_emails_recipient_step"),
+        Index("ix_follow_up_emails_mailbox_sent_at", "mailbox_id", "sent_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("campaign_recipients.id", ondelete="CASCADE"))
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    step: Mapped[int] = mapped_column(Integer)
+    status: Mapped[FollowUpStatus] = mapped_column(str_enum(FollowUpStatus, "follow_up_status"))
+    mailbox_id: Mapped[int | None] = mapped_column(ForeignKey("mailboxes.id"))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    send_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    message_id: Mapped[str | None] = mapped_column(String(300))
+    smtp_response: Mapped[str | None] = mapped_column(String(1000))
+    error: Mapped[str | None] = mapped_column(String(1000))
+    subject_sent: Mapped[str | None] = mapped_column(String(998))
+    body_sent: Mapped[str | None] = mapped_column(Text)
+    sent_copy_saved: Mapped[bool | None] = mapped_column(Boolean)
+    delivery_status: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

@@ -11,7 +11,7 @@ import hmac
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete, distinct, exists, func, or_, select, update
+from sqlalchemy import case, delete, distinct, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.crypto import _key
@@ -19,14 +19,19 @@ from app.models import (
     Campaign,
     CampaignRecipient,
     CampaignStatus,
+    DeliveryEvent,
     DncKind,
     DoNotContact,
     DuplicateStatus,
+    FollowUpEmail,
+    FollowUpStatus,
     Lead,
     LeadDuplicate,
     LeadGroup,
     Mailbox,
     RecipientStatus,
+    Reply,
+    ReplyAnswer,
     lead_group_members,
 )
 from app.services.audit import Actor, log_activity
@@ -76,6 +81,20 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _replies_of(db: Session, email: str, recipient_ids: list[int]) -> list[tuple[Reply, list[ReplyAnswer]]]:
+    replies = db.scalars(
+        select(Reply)
+        .where(or_(Reply.from_email == email, Reply.recipient_id.in_(recipient_ids)))
+        .order_by(Reply.received_at)
+    ).all()
+    answers: dict[int, list[ReplyAnswer]] = {}
+    for a in db.scalars(
+        select(ReplyAnswer).where(ReplyAnswer.reply_id.in_([r.id for r in replies])).order_by(ReplyAnswer.id)
+    ):
+        answers.setdefault(a.reply_id, []).append(a)
+    return [(r, answers.get(r.id, [])) for r in replies]
+
+
 def export_person(db: Session, email: str) -> dict[str, Any]:
     email = normalize_email(email)
     leads = db.scalars(select(Lead).where(Lead.email == email).order_by(Lead.id)).all()
@@ -97,6 +116,36 @@ def export_person(db: Session, email: str) -> dict[str, Any]:
         .where(or_(CampaignRecipient.email == email, CampaignRecipient.lead_id.in_(lead_ids)))
         .order_by(CampaignRecipient.id)
     ).all()
+    follow_ups: dict[int, list[dict[str, Any]]] = {}
+    for f, mailbox_email in db.execute(
+        select(FollowUpEmail, Mailbox.email)
+        .outerjoin(Mailbox, Mailbox.id == FollowUpEmail.mailbox_id)
+        .where(FollowUpEmail.recipient_id.in_([r.id for r, _, _ in emails]))
+        .order_by(FollowUpEmail.recipient_id, FollowUpEmail.step)
+    ):
+        follow_ups.setdefault(f.recipient_id, []).append(
+            {
+                "follow_up": f.step,
+                "status": f.status,
+                "from": mailbox_email,
+                "sent_at": _iso(f.sent_at),
+                "subject": f.subject_sent,
+                "body": f.body_sent,
+            }
+        )
+    their_replies = []
+    for reply, answers in _replies_of(db, email, [r.id for r, _, _ in emails]):
+        their_replies.append(
+            {
+                "received_at": _iso(reply.received_at),
+                "subject": reply.subject,
+                "text": reply.full_text,
+                "our_answers": [
+                    {"sent_at": _iso(a.created_at), "subject": a.subject, "body": a.body, "status": a.status}
+                    for a in answers
+                ],
+            }
+        )
     pending = db.execute(
         select(LeadDuplicate, LeadGroup.name)
         .join(LeadGroup, LeadGroup.id == LeadDuplicate.group_id)
@@ -108,6 +157,16 @@ def export_person(db: Session, email: str) -> dict[str, Any]:
             DoNotContact.kind == DncKind.EMAIL, DoNotContact.value.in_([email, email_hash(email)])
         )
     )
+
+    events: dict[int, list[dict[str, Any]]] = {}
+    for e in db.scalars(
+        select(DeliveryEvent)
+        .where(DeliveryEvent.recipient_id.in_([r.id for r, _, _ in emails]))
+        .order_by(DeliveryEvent.occurred_at)
+    ):
+        events.setdefault(e.recipient_id, []).append(
+            {"at": _iso(e.occurred_at), "status": e.status, "source": e.source, "server_reply": e.response}
+        )
 
     return {
         "email": email,
@@ -135,9 +194,13 @@ def export_person(db: Session, email: str) -> dict[str, Any]:
                 "sent_at": _iso(r.sent_at),
                 "subject": r.subject_sent,
                 "body": r.body_sent,
+                "replied_at": _iso(r.replied_at),
+                "follow_ups": follow_ups.get(r.id, []),
+                "delivery": events.get(r.id, []),
             }
             for r, campaign_name, mailbox_email in emails
         ],
+        "replies": their_replies,
         "waiting_duplicates": [
             {
                 "group": group_name,
@@ -166,14 +229,61 @@ def forget_person(db: Session, email: str, actor: Actor, at: datetime) -> dict[s
 
     if db.scalar(select(exists().where(theirs, CampaignRecipient.status == RecipientStatus.SENDING))):
         raise PersonBusy
+    their_ids = select(CampaignRecipient.id).where(theirs)
+    if db.scalar(
+        select(
+            exists().where(
+                FollowUpEmail.recipient_id.in_(their_ids), FollowUpEmail.status == FollowUpStatus.SENDING
+            )
+        )
+    ):
+        raise PersonBusy
 
     campaigns = db.scalar(select(func.count(distinct(CampaignRecipient.campaign_id))).where(theirs)) or 0
     affected = list(
         db.scalars(
             select(CampaignRecipient.campaign_id).where(
-                theirs, CampaignRecipient.status == RecipientStatus.WAITING
+                theirs,
+                or_(
+                    CampaignRecipient.status == RecipientStatus.WAITING,
+                    CampaignRecipient.next_follow_up_at.is_not(None),
+                ),
             )
         )
+    )
+    # The mail-server log lines about them (they hold the address and server replies naming it).
+    db.execute(
+        delete(DeliveryEvent)
+        .where(or_(DeliveryEvent.recipient_id.in_(their_ids), DeliveryEvent.email == email))
+        .execution_options(synchronize_session=False)
+    )
+    # What they wrote to us, and our answers (cascade), go entirely.
+    replies = db.execute(
+        delete(Reply)
+        .where(or_(Reply.recipient_id.in_(their_ids), Reply.from_email == email))
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    db.execute(
+        update(CampaignRecipient)
+        .where(theirs, CampaignRecipient.next_follow_up_at.is_not(None))
+        .values(next_follow_up_at=None, follow_up_stop="forgotten")
+        .execution_options(synchronize_session=False)
+    )
+    db.execute(
+        update(FollowUpEmail)
+        .where(FollowUpEmail.recipient_id.in_(their_ids))
+        .values(
+            status=case(
+                (FollowUpEmail.status == FollowUpStatus.WAITING, FollowUpStatus.FAILED),
+                else_=FollowUpEmail.status,
+            ),
+            subject_sent=None,
+            body_sent=None,
+            smtp_response=None,
+            error=None,
+            message_id=None,
+        )
+        .execution_options(synchronize_session=False)
     )
     db.execute(
         update(CampaignRecipient)
@@ -230,6 +340,7 @@ def forget_person(db: Session, email: str, actor: Actor, at: datetime) -> dict[s
         "campaigns": campaigns,
         "campaign_emails": history,
         "duplicate_rows": duplicates,
+        "replies": replies,
     }
     log_activity(db, actor, "person.forgotten", entity_type="person", entity_id=hashed, after=result)
     return result

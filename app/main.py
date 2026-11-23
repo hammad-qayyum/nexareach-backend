@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from app.api import (
     auth,
     campaigns,
+    deliverability,
     dnc,
     duplicates,
     groups,
@@ -12,9 +13,12 @@ from app.api import (
     logs,
     mailboxes,
     people,
+    quick_replies,
+    replies,
     reports,
     settings,
     users,
+    warmup,
 )
 from app.core.config import get_settings
 from app.core.errors import init_error_tracking
@@ -56,5 +60,9 @@ for router in (
     campaigns.router,
     reports.router,
     people.router,
+    replies.router,
+    quick_replies.router,
+    warmup.router,
+    deliverability.router,
 ):
     app.include_router(router, prefix="/api")

@@ -20,6 +20,18 @@ lead_group_members = Table(
 class EmailProvider(enum.StrEnum):
     GOOGLE = "GOOGLE"
     MICROSOFT = "MICROSOFT"
+    ZOHO = "ZOHO"
+    YAHOO = "YAHOO"  # Yahoo and AOL
+    ICLOUD = "ICLOUD"
+    PROTON = "PROTON"
+    GODADDY = "GODADDY"
+    TITAN = "TITAN"
+    YANDEX = "YANDEX"
+    AMAZON = "AMAZON"  # Amazon WorkMail / SES
+    MIMECAST = "MIMECAST"  # a filter in front of the real mailbox
+    PROOFPOINT = "PROOFPOINT"  # a filter in front of the real mailbox
+    # The company runs its own mail server (cPanel and similar: the MX is on its own domain).
+    OWN_SERVER = "OWN_SERVER"
     OTHER = "OTHER"
     # The domain has no mail server (MX) we could find.
     UNKNOWN = "UNKNOWN"

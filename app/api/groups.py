@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from email_validator import EmailNotValidError, validate_email
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, func, or_, select
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
@@ -22,7 +22,7 @@ from app.models import (
 from app.services import privacy, sheets
 from app.services.audit import changes, log_activity
 from app.services.auth import normalize_email
-from app.services.geo import timezone_for
+from app.services.geo import region_and_city, timezone_for
 from app.services.providers import detect, detect_many, domain_of
 from app.services.templates import FIXED_FIELDS
 
@@ -102,6 +102,14 @@ class FacetCount(BaseModel):
 class FacetsOut(BaseModel):
     providers: list[FacetCount]
     countries: list[FacetCount]
+    # Every extra-field name used by a lead in the group, A to Z (for the table's columns).
+    custom_keys: list[str]
+
+
+class RecheckOut(BaseModel):
+    checked: int
+    changed: int
+    provider_mix: dict[str, int]
 
 
 class AddLeadOut(BaseModel):
@@ -347,7 +355,7 @@ def _fields(row: LeadRowIn) -> dict[str, Any]:
         "last_name": _clean(row.last_name),
         "company": _clean(row.company),
         "country": country,
-        "timezone": timezone_for(row.timezone, country),
+        "timezone": timezone_for(row.timezone, country, *region_and_city(custom)),
         "custom": custom,
     }
 
@@ -402,10 +410,49 @@ def group_facets(group_id: int, db: DB, _: CurrentUser) -> FacetsOut:
         .group_by(Lead.country)
         .order_by(func.count().desc(), Lead.country)
     )
+    custom_keys = sorted(
+        db.scalars(select(func.jsonb_object_keys(Lead.custom)).where(Lead.id.in_(members)).distinct())
+    )
     return FacetsOut(
         providers=[FacetCount(value=(p.value if p else "PENDING"), count=n) for p, n in providers],
         countries=[FacetCount(value=c, count=n) for c, n in countries],
+        custom_keys=list(custom_keys),
     )
+
+
+@router.post("/{group_id}/recheck-providers", response_model=RecheckOut)
+def recheck_providers(group_id: int, db: DB, _: EditorUser, actor: CurrentActor) -> RecheckOut:
+    """Look up the email provider of every lead in the group again (each domain once).
+
+    For leads imported before a provider was known by name, or whose company has moved its email.
+    """
+    _get(db, group_id)
+    members = select(lead_group_members.c.lead_id).where(lead_group_members.c.group_id == group_id)
+    leads = db.execute(select(Lead.id, Lead.email, Lead.email_provider).where(Lead.id.in_(members))).all()
+    found = detect_many(domain_of(email) for _, email, _ in leads)
+    moves: dict[EmailProvider, list[int]] = {}
+    mix: dict[str, int] = {}
+    for lead_id, email, old in leads:
+        new = found[domain_of(email)]
+        mix[new.value] = mix.get(new.value, 0) + 1
+        if new != old:
+            moves.setdefault(new, []).append(lead_id)
+    for provider, ids in moves.items():
+        for start in range(0, len(ids), 1000):
+            db.execute(
+                update(Lead).where(Lead.id.in_(ids[start : start + 1000])).values(email_provider=provider)
+            )
+    changed = sum(len(ids) for ids in moves.values())
+    log_activity(
+        db,
+        actor,
+        "group.providers_rechecked",
+        entity_type="group",
+        entity_id=group_id,
+        after={"checked": len(leads), "changed": changed},
+    )
+    db.commit()
+    return RecheckOut(checked=len(leads), changed=changed, provider_mix=mix)
 
 
 @router.post("/{group_id}/leads", response_model=AddLeadOut, status_code=status.HTTP_201_CREATED)

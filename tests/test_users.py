@@ -143,3 +143,28 @@ def test_invite_link_uses_app_base_url(client, admin, monkeypatch):
     monkeypatch.setattr(get_settings(), "app_base_url", "https://outreach.example.com/")
     r = client.post("/api/users/invite", json={"name": "Ana", "email": "ana@fastnexa.com", "role": "MEMBER"})
     assert r.json()["invite_url"].startswith("https://outreach.example.com/invite/")  # no "//invite"
+
+
+def test_a_2fa_secret_under_another_key_gives_a_clear_error_and_can_be_reset(client, db, make_user):
+    import pyotp
+
+    from app.cli import apply_2fa_reset
+    from app.core import crypto
+    from tests.conftest import PASSWORD, totp_code
+
+    secret = pyotp.random_base32()
+    user = make_user("boss@fastnexa.com", role=Role.ADMIN, totp_secret=secret)
+    # Saved with some other ENCRYPTION_KEY.
+    other = crypto.AESGCM(b"o" * 32)
+    blob = b"\x00" * 12 + other.encrypt(b"\x00" * 12, secret.encode(), None)
+    user.totp_secret_encrypted = "v1:" + crypto.base64.b64encode(blob).decode()
+    db.flush()
+
+    assert client.post("/api/auth/login", json={"email": user.email, "password": PASSWORD}).status_code == 200
+    r = client.post("/api/auth/2fa/verify", json={"code": totp_code(secret)})
+    assert r.status_code == 409 and r.json()["detail"] == "mfa_secret_unreadable"
+
+    apply_2fa_reset(db, "Boss@FastNexa.com")
+    assert user.totp_enabled is False and user.totp_secret_encrypted is None
+    r = client.post("/api/auth/login", json={"email": user.email, "password": PASSWORD})
+    assert r.json()["mfa"] == "setup"

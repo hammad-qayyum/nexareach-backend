@@ -49,7 +49,14 @@ def test_summary_counts_per_day_mailbox_and_campaign(client, admin, db):
     assert s["mailboxes"] == [{"id": mb["id"], "email": "ali@fastnexa.com", "sent": 1, "failed": 1}]
     [c] = s["campaigns"]
     assert (c["name"], c["sent"], c["failed"], c["total"], c["done"]) == ("Autumn", 1, 1, 3, 2)
-    assert s["totals"] == {"sent": 1, "failed": 1, "skipped": 0, "people": 1}
+    assert s["totals"] == {
+        "sent": 1,
+        "failed": 1,
+        "skipped": 0,
+        "people": 1,
+        "follow_ups_sent": 0,
+        "replied": 0,
+    }
     assert client.get("/api/reports/summary?tz=Mars/Base").status_code == 400
 
 
@@ -82,7 +89,7 @@ def test_export_then_forget_a_person(client, admin, db):
     assert data["emails"][0]["body"] == "Hello A" and data["emails"][0]["campaign"] == "Autumn"
 
     r = client.post("/api/people/forget", json={"email": "a@x.io"})
-    assert r.json() == {"leads": 1, "campaigns": 1, "campaign_emails": 1, "duplicate_rows": 0}
+    assert r.json() == {"leads": 1, "campaigns": 1, "campaign_emails": 1, "duplicate_rows": 0, "replies": 0}
 
     db.expire_all()
     assert db.query(Lead).filter_by(email="a@x.io").count() == 0
