@@ -19,7 +19,8 @@ from app.models import (
     WarmupMessage,
     WarmupStatus,
 )
-from app.services import mailer, replies, sending, warmup
+from app.services import alerts, mailer, replies, sending, warmup
+from app.services.app_settings import set_json
 from tests.test_campaigns import MAILBOX, TUESDAY_11AM_PKT, ready, smtp  # noqa: F401 (shared fixtures)
 
 # Tuesday 10 Nov 2026, 11:00 in Karachi = 06:00 UTC. A working day inside the default 8-19 window.
@@ -318,6 +319,25 @@ def test_helper_answers_are_filed_into_the_warmup_folder(db, smtp, warm):
     assert warm["mailbox"].warmup_folder == "Warmup"
 
 
+def test_filing_only_opens_inboxes_that_warm_up_and_can_log_in(client, ready, db):
+    m = db.get(Mailbox, ready["mailbox"]["id"])
+    m.imap_host, m.warmup_enabled, m.status = "mail.fastnexa.com", False, MailboxStatus.ACTIVE
+    now = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
+    # Warm-up never used: no IMAP logins every 5 minutes.
+    assert warmup.filing_mailbox_ids(db, now) == []
+    m.warmup_enabled = True
+    assert warmup.filing_mailbox_ids(db, now) == [m.id]
+    # Switched off, but it sent warm-up mail 3 days ago: answers may still come, keep filing for a week.
+    m.warmup_enabled = False
+    helper = _helper(db)
+    _results(db, m.id, helper.id, now - timedelta(days=3), inbox=1, spam=0)
+    assert warmup.filing_mailbox_ids(db, now) == [m.id]
+    assert warmup.filing_mailbox_ids(db, now + timedelta(days=5)) == []
+    # A failing login is never retried by filing (cPanel would block the server's IP).
+    m.warmup_enabled, m.status = True, MailboxStatus.ERROR
+    assert warmup.filing_mailbox_ids(db, now) == []
+
+
 def test_reply_checking_ignores_warmup_mail(db, smtp, warm):
     record, _ = _sent_warmup(db, smtp, warm)
     watched = replies.Watched(by_email={"hamza@gmail.com": [1]}, sent_at={1: TUESDAY})
@@ -347,6 +367,7 @@ def _results(db, mailbox_id, helper_id, day: datetime, inbox: int, spam: int):
 
 
 def test_three_poor_days_pause_campaign_sending_but_not_warmup(client, ready, db, smtp):
+    set_json(db, alerts.THRESHOLDS_KEY, {"auto_pause": True}, None)
     mailbox_id = ready["mailbox"]["id"]
     m = db.get(Mailbox, mailbox_id)
     m.ramp_up_enabled = False

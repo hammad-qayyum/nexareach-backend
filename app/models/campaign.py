@@ -94,6 +94,8 @@ class Campaign(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Running campaigns that share a mailbox take turns: the one that sent least recently goes next.
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Deals' service for this campaign's leads (a key from Deals' /services, e.g. "vapt"), sent at handover.
+    deals_service_key: Mapped[str | None] = mapped_column(String(50))
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
 
     groups: Mapped[list[LeadGroup]] = relationship(secondary=campaign_groups)
@@ -109,6 +111,17 @@ class RecipientStatus(enum.StrEnum):
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     CANCELLED = "CANCELLED"
+    # On Deals' do-not-email list (a lead, client, Lost, Meta ad lead or opt-out there): never emailed.
+    # skip_reason holds Deals' reason. Someone already emailed keeps SENT; only their follow-ups stop.
+    BLOCKED_BY_DEALS = "BLOCKED_BY_DEALS"
+    # Replied with interest and handed to Deals as a lead (step 4): the opening email was sent; Deals' sales
+    # team takes it from here and NexaReach stops every follow-up.
+    HANDED_TO_DEALS = "HANDED_TO_DEALS"
+
+
+# Statuses of someone whose opening email went out: daily limits, the 30-day rule, the company limit,
+# reports and reply checking all count both.
+EMAILED = (RecipientStatus.SENT, RecipientStatus.HANDED_TO_DEALS)
 
 
 class CampaignRecipient(Base):
@@ -138,6 +151,8 @@ class CampaignRecipient(Base):
     error: Mapped[str | None] = mapped_column(String(1000))
     # The exact text that went out.
     subject_sent: Mapped[str | None] = mapped_column(String(998))
+    # The subject as written after spintax, before names were filled in: the "email version" in reports.
+    subject_version: Mapped[str | None] = mapped_column(String(998))
     body_sent: Mapped[str | None] = mapped_column(Text)
     html_sent: Mapped[str | None] = mapped_column(Text)
     # Copy in the mailbox's Sent folder: None = not attempted (no IMAP set up), True/False = result.

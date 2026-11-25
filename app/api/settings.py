@@ -4,10 +4,13 @@ from pydantic import BaseModel, Field
 from app.api.deps import DB, AdminUser, CurrentActor, CurrentUser, EditorUser
 from app.models import Mailbox
 from app.services.app_settings import (
+    EMAIL_FOOTER_KEY,
     FOOTER_BUSINESS_NAME,
     FOOTER_POSTAL_ADDRESS,
+    email_footer_settings,
     get_footer,
     get_value,
+    set_json,
     set_value,
 )
 from app.services.audit import changes, log_activity
@@ -76,3 +79,36 @@ def update_invite_settings(
         )
         db.commit()
     return InviteSettings(mailbox_id=body.mailbox_id)
+
+
+class EmailFooterSettings(BaseModel):
+    # On: every campaign and follow-up email ends with the opt-out line and the postal address (from the
+    # business details), and carries a List-Unsubscribe header. Off: an email is exactly what was written.
+    enabled: bool
+    optout_line: str = Field(min_length=5, max_length=300)
+
+
+@router.get("/email-footer", response_model=EmailFooterSettings)
+def read_email_footer(db: DB, _: CurrentUser) -> EmailFooterSettings:
+    enabled, line = email_footer_settings(db)
+    return EmailFooterSettings(enabled=enabled, optout_line=line)
+
+
+@router.put("/email-footer", response_model=EmailFooterSettings)
+def update_email_footer(
+    body: EmailFooterSettings, db: DB, user: EditorUser, actor: CurrentActor
+) -> EmailFooterSettings:
+    line = " ".join(body.optout_line.split())
+    if body.enabled and not get_value(db, FOOTER_POSTAL_ADDRESS).strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "postal_address_required")
+    enabled, old_line = email_footer_settings(db)
+    before = {"enabled": enabled, "optout_line": old_line}
+    after = {"enabled": body.enabled, "optout_line": line}
+    if before != after:
+        set_json(db, EMAIL_FOOTER_KEY, after, user.id)
+        old, new = changes(before, after)
+        log_activity(
+            db, actor, "settings.email_footer_updated", entity_type="settings", before=old, after=new
+        )
+        db.commit()
+    return EmailFooterSettings(**after)

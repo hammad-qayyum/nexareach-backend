@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
+    EMAILED,
     Campaign,
     CampaignRecipient,
     CampaignStatus,
@@ -27,14 +28,13 @@ from app.models import (
     PlacementState,
     PlacementTest,
     PlacementTestStatus,
-    RecipientStatus,
     WarmupHelper,
     campaign_mailboxes,
 )
 from app.services import alerts, mailer, warmup, warmup_content
-from app.services.app_settings import business_fields
+from app.services.app_settings import business_fields, email_footer
 from app.services.audit import SYSTEM, Actor, log_activity
-from app.services.templates import compose
+from app.services.templates import add_footer, compose
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +149,8 @@ def _send(
         subject, body, html = compose(
             campaign.subject, campaign.body, fields, mailbox.display_name, rng, campaign.body_format
         )
+        # As the campaign really goes out, footer included.
+        body, html = add_footer(body, html, email_footer(db))
     else:
         subject, body = warmup_content.message(rng, mailbox.display_name, helper.display_name)
         html = None
@@ -299,7 +301,7 @@ def weekly(db: Session, at: datetime) -> int:
     ):
         recent_send = db.scalar(
             select(func.max(CampaignRecipient.sent_at)).where(
-                CampaignRecipient.mailbox_id == mailbox.id, CampaignRecipient.status == RecipientStatus.SENT
+                CampaignRecipient.mailbox_id == mailbox.id, CampaignRecipient.status.in_(EMAILED)
             )
         )
         last_test = db.scalar(

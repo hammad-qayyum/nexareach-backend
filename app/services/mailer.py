@@ -143,6 +143,7 @@ def build_message(
     *,
     thread: list[str] | None = None,
     message_id: str | None = None,
+    list_unsubscribe: bool = False,
 ) -> EmailMessage:
     """`thread`: Message-IDs of the earlier emails in the conversation, oldest first. A follow-up sets
     In-Reply-To and References from them, so mail apps show it under the first email."""
@@ -155,6 +156,11 @@ def build_message(
     if thread:
         msg["In-Reply-To"] = thread[-1]
         msg["References"] = " ".join(thread)
+    if list_unsubscribe:
+        # Mail apps show an "Unsubscribe" button that emails this mailbox; reply checking reads a message with
+        # the subject "unsubscribe" as an opt-out. No one-click HTTPS link (List-Unsubscribe-Post): there's
+        # no public unsubscribe page.
+        msg["List-Unsubscribe"] = f"<mailto:{mailbox.email}?subject=unsubscribe>"
     msg.set_content(body)
     if html:
         # multipart/alternative: mail apps show the HTML, and fall back to the plain text.

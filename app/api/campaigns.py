@@ -1,3 +1,4 @@
+import logging
 import random
 import re
 from datetime import datetime
@@ -16,10 +17,13 @@ from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import DeliveryEventOut, Page
 from app.core.config import get_settings
 from app.models import (
+    EMAILED,
     BodyFormat,
     Campaign,
     CampaignRecipient,
     CampaignStatus,
+    DealsHandover,
+    DealsLeadResult,
     DeliveryEvent,
     DeliveryStatus,
     EmailProvider,
@@ -34,17 +38,20 @@ from app.models import (
     campaign_exclusions,
     lead_group_members,
 )
-from app.services import mailer, replies, sending
-from app.services.app_settings import BUSINESS_FIELDS, business_fields
+from app.services import deals, mailer, replies, sending
+from app.services.app_settings import BUSINESS_FIELDS, business_fields, email_footer
 from app.services.audit import changes, log_activity, snapshot
 from app.services.csv_export import csv_response
+from app.services.deals_client import DealsError
 from app.services.email_html import sanitize, to_text
-from app.services.templates import FIXED_FIELDS, compose, lead_fields, variables_used
+from app.services.templates import FIXED_FIELDS, add_footer, compose, lead_fields, variables_used
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 AUDIT_FIELDS = [
     "name",
+    "deals_service_key",
     "status",
     "subject",
     "body",
@@ -136,6 +143,8 @@ class CampaignIn(Schedule):
     follow_ups_enabled: bool = True
     group_ids: list[int] = Field(default_factory=list, max_length=100)
     mailbox_ids: list[int] = Field(default_factory=list, max_length=100)
+    # Deals' service for leads from this campaign (a key from Deals' service list), sent at handover.
+    deals_service_key: str | None = Field(default=None, max_length=50)
 
 
 class CampaignUpdateIn(BaseModel):
@@ -154,6 +163,8 @@ class CampaignUpdateIn(BaseModel):
     send_days: list[int] | None = None
     start_hour: int | None = None
     end_hour: int | None = None
+    # Any time, like the name: it only matters when a reply is handed to Deals. "" clears it.
+    deals_service_key: str | None = Field(default=None, max_length=50)
 
 
 class GroupRef(BaseModel):
@@ -181,6 +192,11 @@ class Counts(BaseModel):
     failed: int = 0
     skipped: int = 0
     cancelled: int = 0
+    # On Deals' do-not-email list: never emailed. Left out of the answer while 0 (it only happens with the
+    # Deals check switched on), so nothing changes for anyone who doesn't use it.
+    blocked_by_deals: int = Field(default=0, exclude_if=lambda n: n == 0)
+    # Replied with interest and handed to Deals (their opening email was sent). Left out while 0.
+    handed_to_deals: int = Field(default=0, exclude_if=lambda n: n == 0)
     # Follow-ups and answers.
     follow_ups_sent: int = 0
     # People with a follow-up still to come.
@@ -211,6 +227,7 @@ class CampaignOut(BaseModel):
     start_hour: int
     end_hour: int
     use_lead_timezone: bool
+    deals_service_key: str | None = None
     # Leads in the chosen groups that were unticked before starting.
     excluded_count: int
     started_at: datetime | None
@@ -259,6 +276,15 @@ class RecipientOut(BaseModel):
     delivery_status: str | None = None
     # The mail-server log for this person (sends, cPanel lines, bounces), oldest first.
     delivery: list[DeliveryEventOut] = []
+    # Handed to Deals (integration steps 4-5): the lead's link, its stage there and the Won value.
+    deals: "RecipientDealsOut | None" = None
+
+
+class RecipientDealsOut(BaseModel):
+    status: str
+    lead_url: str | None
+    stage: str | None
+    value_usd: int | None
 
 
 class PreviewIn(BaseModel):
@@ -381,6 +407,7 @@ def _out(c: Campaign, counts: Counts, excluded: int = 0) -> CampaignOut:
         body_format=c.body_format,
         follow_ups=[FollowUpStepOut(**f) for f in c.follow_ups or []],
         follow_ups_enabled=c.follow_ups_enabled,
+        deals_service_key=c.deals_service_key,
         groups=[GroupRef(id=g.id, name=g.name) for g in c.groups],
         mailboxes=[
             MailboxRef(
@@ -524,6 +551,7 @@ def create_campaign(body: CampaignIn, db: DB, user: EditorUser, actor: CurrentAc
         start_hour=body.start_hour,
         end_hour=body.end_hour,
         created_by_id=user.id,
+        deals_service_key=(body.deals_service_key or "").strip() or None,
         groups=_load(db, LeadGroup, body.group_ids, "group_not_found"),
         mailboxes=_usable_mailboxes(db, body.mailbox_ids, already=[]),
     )
@@ -550,8 +578,10 @@ def preview(body: PreviewIn, db: DB, _: CurrentUser) -> PreviewOut:
     fields = {**business_fields(db), **(lead_fields(lead) if lead else {})}
     rng = random.Random()  # noqa: S311
     versions = []
+    footer = email_footer(db)
     for _ in range(3):
         subject, text, html = compose(body.subject, body.body, fields, sender_name, rng, body.body_format)
+        text, html = add_footer(text, html, footer)
         versions.append(PreviewVersion(subject=subject, body=text, html=html))
     available = _available_fields(db, body.group_ids)
     unknown = sorted(variables_used(body.subject, body.body) - set(available))
@@ -578,7 +608,7 @@ def update_campaign(
 ) -> CampaignOut:
     campaign = _get(db, campaign_id)
     sent = body.model_dump(exclude_unset=True)
-    changed = set(sent) - {"name"}
+    changed = set(sent) - {"name", "deals_service_key"}
     if campaign.status == CampaignStatus.PAUSED and not changed <= PAUSED_EDITABLE:
         raise HTTPException(status.HTTP_409_CONFLICT, "campaign_not_editable")
     if campaign.status not in (CampaignStatus.DRAFT, CampaignStatus.PAUSED) and changed:
@@ -601,6 +631,8 @@ def update_campaign(
         setattr(campaign, field, value)
     if body.name is not None:
         campaign.name = body.name.strip()
+    if "deals_service_key" in sent:
+        campaign.deals_service_key = (body.deals_service_key or "").strip() or None
     if body.subject is not None:
         campaign.subject = body.subject
     if body.body_format is not None:
@@ -655,7 +687,23 @@ def start_campaign(campaign_id: int, db: DB, _: EditorUser, actor: CurrentActor)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_active_mailbox")
     if any(mailer.development_block(m) for m in campaign.mailboxes):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "dev_real_mailbox")
-    sending.start(db, campaign, actor, sending.now())
+    footer = email_footer(db)
+    if footer is not None and not footer.postal_address:
+        # Every email carries the postal address once the opt-out footer is on (CAN-SPAM).
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "postal_address_required")
+    at = sending.now()
+    check = None
+    if deals.blocklist_enabled(db):
+        # Check 2: Deals itself is asked about every recipient. If it can't be asked, nobody is emailed.
+        def check(hashes: list[str]) -> dict[str, tuple[str, datetime | None]]:
+            return deals.check_for_start(db, hashes, at)
+
+    try:
+        sending.start(db, campaign, actor, at, deals_check=check)
+    except DealsError as e:
+        db.rollback()
+        log.warning("campaign %s: Deals check failed: %s", campaign_id, e)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "deals_check_failed") from e
     db.commit()
     return _full(db, campaign)
 
@@ -743,14 +791,25 @@ def send_test(campaign_id: int, body: SendTestIn, db: DB, _: EditorUser, actor: 
         campaign.subject, campaign.body, fields, mailbox.display_name, rng, campaign.body_format
     )
     subject = f"[Test] {subject}"
-    messages = [mailer.build_message(mailbox, str(body.to), subject, text, html)]
+    footer = email_footer(db)
+    text, html = add_footer(text, html, footer)
+    unsubscribe = footer is not None
+    messages = [
+        mailer.build_message(mailbox, str(body.to), subject, text, html, list_unsubscribe=unsubscribe)
+    ]
     if body.include_follow_ups and campaign.follow_ups_enabled:
         for step in campaign.follow_ups or []:
             _, follow_text, _ = compose("", step["body"], fields, mailbox.display_name, rng)
+            follow_text, _ = add_footer(follow_text, None, footer)
             thread = [m["Message-ID"] for m in messages]
             messages.append(
                 mailer.build_message(
-                    mailbox, str(body.to), sending.reply_subject(subject), follow_text, thread=thread
+                    mailbox,
+                    str(body.to),
+                    sending.reply_subject(subject),
+                    follow_text,
+                    thread=thread,
+                    list_unsubscribe=unsubscribe,
                 )
             )
     try:
@@ -842,6 +901,25 @@ def _delivery_of(db: DB, recipient_ids: list[int]) -> dict[int, list[DeliveryEve
     return result
 
 
+def _handovers_of(db: DB, recipient_ids: list[int]) -> dict[int, "RecipientDealsOut"]:
+    """The newest handover per person (a repeat reply adds one), with Deals' result for the lead."""
+    found: dict[int, RecipientDealsOut] = {}
+    rows = db.execute(
+        select(DealsHandover, DealsLeadResult)
+        .outerjoin(DealsLeadResult, DealsLeadResult.deals_lead_id == DealsHandover.deals_lead_id)
+        .where(DealsHandover.recipient_id.in_(recipient_ids), DealsHandover.band != "repeat")
+        .order_by(DealsHandover.id)
+    )
+    for h, result in rows:
+        found[h.recipient_id] = RecipientDealsOut(
+            status=h.status,
+            lead_url=h.deals_lead_url,
+            stage=result.stage if result else None,
+            value_usd=result.value_usd if result else None,
+        )
+    return found
+
+
 def _last_replies(db: DB, recipient_ids: list[int]) -> dict[int, int]:
     return dict(
         db.execute(
@@ -859,6 +937,7 @@ def _recipient_out(
     follow_ups: list[FollowUpOut] | None = None,
     last_reply_id: int | None = None,
     delivery: list[DeliveryEventOut] | None = None,
+    deals_info: "RecipientDealsOut | None" = None,
 ) -> RecipientOut:
     return RecipientOut(
         id=r.id,
@@ -885,6 +964,7 @@ def _recipient_out(
         last_reply_id=last_reply_id,
         delivery_status=r.delivery_status,
         delivery=delivery or [],
+        deals=deals_info,
     )
 
 
@@ -909,9 +989,12 @@ def list_recipients(
     rows = db.execute(query.order_by(CampaignRecipient.id).limit(limit).offset(offset)).all()
     ids = [r.id for r, _, _ in rows]
     follow_ups, last_replies, events = _follow_ups_of(db, ids), _last_replies(db, ids), _delivery_of(db, ids)
+    handovers = _handovers_of(db, ids)
     return Page(
         items=[
-            _recipient_out(r, lead, m, follow_ups[r.id], last_replies.get(r.id), events[r.id])
+            _recipient_out(
+                r, lead, m, follow_ups[r.id], last_replies.get(r.id), events[r.id], handovers.get(r.id)
+            )
             for r, lead, m in rows
         ],
         total=total,
@@ -926,7 +1009,7 @@ def mark_replied(
     recipient = db.get(CampaignRecipient, recipient_id, with_for_update=True)
     if recipient is None or recipient.campaign_id != campaign_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "recipient_not_found")
-    if recipient.status != RecipientStatus.SENT:
+    if recipient.status not in EMAILED:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "not_sent")
     if recipient.replied_at is None:
         replies.mark_replied(db, recipient, actor, sending.now())

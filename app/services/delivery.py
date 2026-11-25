@@ -156,6 +156,9 @@ def bounced(db: Session, recipient: CampaignRecipient, status: DeliveryStatus, s
             entity_id=added,
             after={"reason": "hard_bounce", "campaign_id": recipient.campaign_id},
         )
+        from app.services import deals_optouts  # deals_optouts → deals → alerts; keep import order simple
+
+        deals_optouts.queue_value(db, added)
 
 
 def timeline(db: Session, recipient_id: int) -> list[DeliveryEvent]:

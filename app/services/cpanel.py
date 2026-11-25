@@ -26,13 +26,13 @@ from sqlalchemy.orm import Session
 
 from app.core.crypto import decrypt
 from app.models import (
+    EMAILED,
     CampaignRecipient,
     DeliverySource,
     DeliveryStatus,
     FollowUpEmail,
     FollowUpStatus,
     Mailbox,
-    RecipientStatus,
 )
 from app.services import alerts, delivery
 from app.services.app_settings import get_json, set_json
@@ -132,7 +132,7 @@ def _sent_emails(db: Session, since: datetime) -> list[_Sent]:
         _Sent(r, None, r.mailbox_id, r.email, r.sent_at)
         for r in db.scalars(
             select(CampaignRecipient).where(
-                CampaignRecipient.status == RecipientStatus.SENT, CampaignRecipient.sent_at >= since
+                CampaignRecipient.status.in_(EMAILED), CampaignRecipient.sent_at >= since
             )
         )
     ]

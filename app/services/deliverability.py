@@ -14,13 +14,13 @@ from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
 from app.models import (
+    EMAILED,
     CampaignRecipient,
     DeliveryStatus,
     FollowUpEmail,
     FollowUpStatus,
     Mailbox,
     MailboxStatus,
-    RecipientStatus,
     WarmupHelper,
 )
 from app.services import alerts, cpanel
@@ -46,7 +46,7 @@ class BounceRate:
 def bounce_rate(db: Session, mailbox: Mailbox, window: int) -> BounceRate:
     """Hard bounces among the mailbox's last `window` opening emails (since sending was last resumed)."""
     query = select(CampaignRecipient.delivery_status).where(
-        CampaignRecipient.mailbox_id == mailbox.id, CampaignRecipient.status == RecipientStatus.SENT
+        CampaignRecipient.mailbox_id == mailbox.id, CampaignRecipient.status.in_(EMAILED)
     )
     if mailbox.campaigns_resumed_at is not None:
         query = query.where(CampaignRecipient.sent_at > mailbox.campaigns_resumed_at)
@@ -58,7 +58,7 @@ def bounce_rate(db: Session, mailbox: Mailbox, window: int) -> BounceRate:
 def _messages(since: datetime, mailbox_ids: list[int] | None = None):
     """(mailbox_id, delivery_status) of every opening email and follow-up sent since then."""
     first = select(CampaignRecipient.mailbox_id, CampaignRecipient.delivery_status).where(
-        CampaignRecipient.status == RecipientStatus.SENT, CampaignRecipient.sent_at >= since
+        CampaignRecipient.status.in_(EMAILED), CampaignRecipient.sent_at >= since
     )
     follow = select(FollowUpEmail.mailbox_id, FollowUpEmail.delivery_status).where(
         FollowUpEmail.status == FollowUpStatus.SENT, FollowUpEmail.sent_at >= since

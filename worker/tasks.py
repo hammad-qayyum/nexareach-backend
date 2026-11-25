@@ -4,7 +4,19 @@ from sqlalchemy.dialects.postgresql import insert
 from app.api.health import WORKER_HEARTBEAT_KEY
 from app.core.db import SessionLocal
 from app.models import Setting
-from app.services import deliverability, dmarc, domain_health, placement, replies, sending, warmup
+from app.services import (
+    deals,
+    deals_events,
+    deals_handover,
+    deals_optouts,
+    deliverability,
+    dmarc,
+    domain_health,
+    placement,
+    replies,
+    sending,
+    warmup,
+)
 from app.services.auth import now
 from worker.app import app
 
@@ -103,3 +115,41 @@ def placement_weekly(timestamp: int) -> None:
     """Mondays 11:00 in Pakistan: a placement test for each mailbox that sent campaign emails lately."""
     with SessionLocal() as db:
         placement.weekly(db, now())
+
+
+# --- Deals (deals.fastnexa.com). Both do nothing while the do-not-email list is switched off. -------------
+
+
+@app.periodic(cron="*/10 * * * *")
+@app.task(queueing_lock="deals-blocklist-delta", lock="deals-blocklist")
+def deals_blocklist_delta(timestamp: int) -> None:
+    """What changed on Deals' do-not-email list (a full fetch if none has ever succeeded)."""
+    deals.run_blocklist_sync()
+
+
+@app.periodic(cron="40 2 * * *")
+@app.task(queueing_lock="deals-blocklist-full", lock="deals-blocklist")
+def deals_blocklist_full(timestamp: int) -> None:
+    """Daily (07:40 in Pakistan): the whole list again, replacing the copy."""
+    deals.run_blocklist_sync(full=True)
+
+
+@app.periodic(cron="*/2 * * * *")
+@app.task(queueing_lock="deals-optouts-push", lock="deals-optouts")
+def deals_optouts_push(timestamp: int) -> None:
+    """Shares new do-not-contact entries with Deals (and catches up older ones). Off by default."""
+    deals_optouts.run_push()
+
+
+@app.periodic(cron="* * * * *")
+@app.task(queueing_lock="deals-handovers", lock="deals-handovers")
+def deals_handovers(timestamp: int) -> None:
+    """Hands queued interested replies to Deals (retries after 1, 5, 15, 60 minutes, then hourly)."""
+    deals_handover.run_due()
+
+
+@app.periodic(cron="*/5 * * * *")
+@app.task(queueing_lock="deals-events", lock="deals-events")
+def deals_events_sync(timestamp: int) -> None:
+    """Stage changes, Won values and Lost reasons from Deals for the leads NexaReach handed over."""
+    deals_events.run()

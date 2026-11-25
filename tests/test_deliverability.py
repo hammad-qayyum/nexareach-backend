@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.crypto import encrypt
 from app.models import (
@@ -44,6 +44,7 @@ from app.services import (
     replies,
 )
 from app.services import sending as sending_service
+from app.services.app_settings import set_json
 from tests.test_campaigns import TUESDAY_11AM_PKT, ready, smtp  # noqa: F401 (shared fixtures)
 from tests.test_follow_ups import FakeInbox, _start_and_send_first, campaign  # noqa: F401
 from tests.test_warmup import FakeInbox as FakeImap
@@ -283,7 +284,29 @@ def _sent_rows(db, mailbox_id, campaign_id, n, hard, start):
     db.flush()
 
 
+def pause_on(db) -> None:
+    """Switch on "Pause sending on serious problems" (off by default: alerts only warn)."""
+    set_json(db, alerts.THRESHOLDS_KEY, {"auto_pause": True}, None)
+
+
+def test_serious_problems_only_warn_until_pausing_is_switched_on(client, db, ready):
+    mailbox_id, campaign_id = ready["mailbox"]["id"], ready["campaign"]["id"]
+    _sent_rows(db, mailbox_id, campaign_id, 100, 5, TUESDAY_11AM_PKT)
+    new = deliverability.evaluate(db, DAY2)
+    assert [a.kind for a in new] == ["hard_bounces"] and new[0].paused_mailbox_ids == []
+    mailbox = db.get(Mailbox, mailbox_id)
+    assert mailbox.campaigns_paused_at is None
+    # Switched on while the problem is still there: the next check pauses, without a second alert.
+    r = client.put("/api/deliverability/settings/thresholds", json={"auto_pause": True})
+    assert r.status_code == 200 and r.json()["thresholds"]["auto_pause"] is True
+    assert deliverability.evaluate(db, DAY2 + timedelta(minutes=10)) == []
+    assert mailbox.campaigns_paused_reason == "hard_bounces"
+    assert db.get(Alert, new[0].id).paused_mailbox_ids == [mailbox_id]
+    assert db.scalar(select(func.count()).select_from(Alert)) == 1
+
+
 def test_too_many_hard_bounces_pause_the_mailbox_until_resumed(client, db, ready):
+    pause_on(db)
     mailbox_id, campaign_id = ready["mailbox"]["id"], ready["campaign"]["id"]
     # 3 of 100 is the limit, not over it.
     _sent_rows(db, mailbox_id, campaign_id, 100, 3, TUESDAY_11AM_PKT)
@@ -395,6 +418,7 @@ def test_a_healthy_domain(db, ready):
 
 
 def test_broken_dns_and_a_blacklisting_pause_sending(db, ready):
+    pause_on(db)
     records = {**GOOD_DNS, ("fastnexa.com", "TXT"): []}
     domain_health.run(db, DAY2, _lookup(records, listed=("bl.spamcop.net",)), _cert(5))
     kinds = {a.kind: a for a in db.scalars(select(Alert))}

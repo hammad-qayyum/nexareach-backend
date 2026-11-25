@@ -2,11 +2,12 @@
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import exists, func, or_, select, true
+from sqlalchemy.orm import aliased
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import Page
@@ -14,6 +15,8 @@ from app.models import (
     AnswerStatus,
     Campaign,
     CampaignRecipient,
+    DealsHandover,
+    DealsLeadResult,
     FollowUpEmail,
     FollowUpStatus,
     Lead,
@@ -23,7 +26,7 @@ from app.models import (
     ReplyKind,
     User,
 )
-from app.services import replies, sending
+from app.services import deals_handover, replies, sending
 from app.services.app_settings import business_fields
 from app.services.audit import log_activity
 from app.services.templates import lead_fields
@@ -32,6 +35,8 @@ router = APIRouter(prefix="/replies", tags=["replies"])
 
 
 class ReplyState(StrEnum):
+    # Needs review: scored between the two cut-offs (or 80+ while handover is off); a person decides.
+    REVIEW = "review"
     UNREAD = "unread"
     # Not marked done yet (read or not).
     OPEN = "open"
@@ -42,6 +47,20 @@ class ReplyState(StrEnum):
 class CampaignRef(BaseModel):
     id: int
     name: str
+
+
+class HandoverOut(BaseModel):
+    """Handed to Deals (integration step 4): queued, created, existing, blocked or failed."""
+
+    status: str
+    band: str
+    approved_by: str | None
+    deals_lead_url: str | None
+    error: str | None
+    # From Deals' results (step 5): the stage, the Won value and the Lost reason.
+    stage: str | None = None
+    value_usd: int | None = None
+    lost_reason: str | None = None
 
 
 class ReplyOut(BaseModel):
@@ -61,6 +80,15 @@ class ReplyOut(BaseModel):
     has_attachments: bool
     mailbox_email: str
     campaign: CampaignRef | None
+    # The reply score (step 3; None while scoring is off) and the review list.
+    score: int | None = None
+    score_band: str | None = None
+    score_rules: list[str] | None = None
+    review_status: str | None = None
+    review_reason: str | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+    handover: HandoverOut | None = None
 
 
 class ThreadItem(BaseModel):
@@ -101,6 +129,7 @@ class ReplyDetail(ReplyOut):
 
 
 class CountOut(BaseModel):
+    review: int
     unread: int
     open: int
     done: int
@@ -135,6 +164,7 @@ class AnswerOut(BaseModel):
 
 def _state_filter(state: ReplyState):  # noqa: ANN202 - a SQLAlchemy condition
     return {
+        ReplyState.REVIEW: Reply.review_status == "pending",
         ReplyState.UNREAD: Reply.read_at.is_(None) & Reply.done_at.is_(None),
         ReplyState.OPEN: Reply.done_at.is_(None),
         ReplyState.DONE: Reply.done_at.is_not(None),
@@ -148,8 +178,30 @@ def _lead_name(lead: Lead | None) -> str | None:
     return " ".join(p for p in (lead.first_name, lead.last_name) if p) or None
 
 
+def _handover_out(h: DealsHandover | None, result: DealsLeadResult | None) -> HandoverOut | None:
+    if h is None:
+        return None
+    return HandoverOut(
+        status=h.status,
+        band=h.band,
+        approved_by=h.approved_by_name,
+        deals_lead_url=h.deals_lead_url,
+        error=h.last_error if h.status in ("queued", "failed") else None,
+        stage=result.stage if result else None,
+        value_usd=result.value_usd if result else None,
+        lost_reason=result.lost_reason if result else None,
+    )
+
+
 def _out(
-    r: Reply, lead: Lead | None, mailbox_email: str, campaign: Campaign | None, answered: bool
+    r: Reply,
+    lead: Lead | None,
+    mailbox_email: str,
+    campaign: Campaign | None,
+    answered: bool,
+    handover: DealsHandover | None = None,
+    reviewer: str | None = None,
+    result: DealsLeadResult | None = None,
 ) -> ReplyOut:
     return ReplyOut(
         id=r.id,
@@ -167,17 +219,29 @@ def _out(
         has_attachments=r.has_attachments,
         mailbox_email=mailbox_email,
         campaign=CampaignRef(id=campaign.id, name=campaign.name) if campaign else None,
+        score=r.score,
+        score_band=r.score_band,
+        score_rules=r.score_rules,
+        review_status=r.review_status,
+        review_reason=r.review_reason,
+        reviewed_by=reviewer,
+        reviewed_at=r.reviewed_at,
+        handover=_handover_out(handover, result),
     )
 
 
 def _query():  # noqa: ANN202
     answered = exists().where(ReplyAnswer.reply_id == Reply.id, ReplyAnswer.status == AnswerStatus.SENT)
+    reviewer = aliased(User)
     return (
-        select(Reply, Lead, Mailbox.email, Campaign, answered)
+        select(Reply, Lead, Mailbox.email, Campaign, answered, DealsHandover, reviewer.name, DealsLeadResult)
         .join(Mailbox, Mailbox.id == Reply.mailbox_id)
         .outerjoin(CampaignRecipient, CampaignRecipient.id == Reply.recipient_id)
         .outerjoin(Lead, Lead.id == CampaignRecipient.lead_id)
         .outerjoin(Campaign, Campaign.id == Reply.campaign_id)
+        .outerjoin(DealsHandover, DealsHandover.reply_id == Reply.id)
+        .outerjoin(reviewer, reviewer.id == Reply.reviewed_by_id)
+        .outerjoin(DealsLeadResult, DealsLeadResult.deals_lead_id == DealsHandover.deals_lead_id)
     )
 
 
@@ -206,7 +270,12 @@ def list_replies(
             )
         )
     total = db.scalar(select(func.count()).select_from(query.subquery()))
-    rows = db.execute(query.order_by(Reply.received_at.desc(), Reply.id.desc()).limit(limit).offset(offset))
+    # The review list is worked through oldest first; the inbox shows the newest first.
+    if state == ReplyState.REVIEW:
+        order = (Reply.received_at.asc(), Reply.id.asc())
+    else:
+        order = (Reply.received_at.desc(), Reply.id.desc())
+    rows = db.execute(query.order_by(*order).limit(limit).offset(offset))
     return Page(items=[_out(*row) for row in rows], total=total)
 
 
@@ -221,8 +290,9 @@ def _checked_mailboxes(db: DB) -> tuple[int, datetime | None]:
 
 @router.get("/count", response_model=CountOut)
 def count_replies(db: DB, _: CurrentUser) -> CountOut:
-    unread, open_, done, all_ = db.execute(
+    review, unread, open_, done, all_ = db.execute(
         select(
+            func.count().filter(_state_filter(ReplyState.REVIEW)),
             func.count().filter(_state_filter(ReplyState.UNREAD)),
             func.count().filter(_state_filter(ReplyState.OPEN)),
             func.count().filter(_state_filter(ReplyState.DONE)),
@@ -231,7 +301,13 @@ def count_replies(db: DB, _: CurrentUser) -> CountOut:
     ).one()
     checked, checked_at = _checked_mailboxes(db)
     return CountOut(
-        unread=unread, open=open_, done=done, all=all_, checked_mailboxes=checked, checked_at=checked_at
+        review=review,
+        unread=unread,
+        open=open_,
+        done=done,
+        all=all_,
+        checked_mailboxes=checked,
+        checked_at=checked_at,
     )
 
 
@@ -349,7 +425,7 @@ def _details(db: DB, reply: Reply, lead: Lead | None, campaign: Campaign | None)
 
 def _detail(db: DB, reply: Reply) -> ReplyDetail:
     row = db.execute(_query().where(Reply.id == reply.id)).one()
-    _, lead, _, campaign, _ = row
+    _, lead, _, campaign, *_ = row
     return ReplyDetail(
         **_out(*row).model_dump(),
         text=reply.text,
@@ -400,3 +476,74 @@ def answer_reply(reply_id: int, body: AnswerIn, db: DB, user: EditorUser, actor:
     result = replies.answer(db, reply, body.body, user.id, actor, sending.now())
     ok = result.answer.status == AnswerStatus.SENT
     return AnswerOut(ok=ok, detail=result.detail, reply=_detail(db, reply))
+
+
+# --- Needs review and Send to Deals (Deals integration steps 3 and 4) -------------------------------------
+
+
+class NotNowIn(BaseModel):
+    reason: Literal["not_interested", "wrong_person", "too_small", "other"]
+    note: str = Field(default="", max_length=500)
+
+
+@router.post("/{reply_id}/send-to-deals", response_model=ReplyDetail)
+def send_to_deals(
+    reply_id: int, db: DB, user: EditorUser, actor: CurrentActor, background: BackgroundTasks
+) -> ReplyDetail:
+    """Hand this person to Deals: "approved" from the review list, or "manual" for a reply under the cut-off.
+    Logged with who decided."""
+    reply = _get(db, reply_id)
+    if not deals_handover.enabled(db):
+        raise HTTPException(status.HTTP_409_CONFLICT, "deals_handover_off")
+    if reply.recipient_id is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "reply_without_campaign")
+    if reply.kind == ReplyKind.OPT_OUT or reply.score_band == "zero":
+        raise HTTPException(status.HTTP_409_CONFLICT, "reply_hard_stop")
+    if db.scalar(select(DealsHandover.id).where(DealsHandover.reply_id == reply.id)) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "already_sent_to_deals")
+    now = sending.now()
+    band = (
+        "approved" if reply.review_status == "pending" or reply.score_band in ("auto", "review") else "manual"
+    )
+    reply.review_status = "approved"
+    reply.reviewed_by_id = user.id
+    reply.reviewed_at = now
+    deals_handover.queue(db, reply, band, now, approved_by=user, actor=actor)
+    log_activity(
+        db,
+        actor,
+        "reply.sent_to_deals",
+        entity_type="reply",
+        entity_id=reply.id,
+        after={"band": band, "score": reply.score},
+    )
+    db.commit()
+    background.add_task(deals_handover.run_due)  # try at once; the worker retries if Deals is down
+    return _detail(db, reply)
+
+
+@router.post("/{reply_id}/not-now", response_model=ReplyDetail)
+def not_now(reply_id: int, body: NotNowIn, db: DB, user: EditorUser, actor: CurrentActor) -> ReplyDetail:
+    """Keep this reply in NexaReach (off the review list), with a short reason."""
+    reply = _get(db, reply_id)
+    if db.scalar(select(DealsHandover.id).where(DealsHandover.reply_id == reply.id)) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "already_sent_to_deals")
+    if body.reason == "other" and not body.note.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "note_required")
+    reason = body.reason + (f": {body.note.strip()}" if body.note.strip() else "")
+    before = reply.review_status
+    reply.review_status = "rejected"
+    reply.review_reason = reason
+    reply.reviewed_by_id = user.id
+    reply.reviewed_at = sending.now()
+    log_activity(
+        db,
+        actor,
+        "reply.review_rejected",
+        entity_type="reply",
+        entity_id=reply.id,
+        before={"review_status": before},
+        after={"review_status": "rejected", "reason": reason, "score": reply.score},
+    )
+    db.commit()
+    return _detail(db, reply)

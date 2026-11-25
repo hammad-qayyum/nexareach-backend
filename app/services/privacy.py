@@ -322,12 +322,17 @@ def forget_person(db: Session, email: str, actor: Actor, at: datetime) -> dict[s
         delete(Lead).where(Lead.id.in_(lead_ids)).execution_options(synchronize_session=False)
     ).rowcount
     db.execute(delete(DoNotContact).where(DoNotContact.kind == DncKind.EMAIL, DoNotContact.value == email))
-    if not db.scalar(select(exists().where(DoNotContact.value == hashed))):
-        db.add(
-            DoNotContact(
-                value=hashed, kind=DncKind.EMAIL, reason=FORGOTTEN_REASON, created_by_id=actor.user_id
-            )
+    entry = db.scalar(select(DoNotContact).where(DoNotContact.value == hashed))
+    if entry is None:
+        entry = DoNotContact(
+            value=hashed, kind=DncKind.EMAIL, reason=FORGOTTEN_REASON, created_by_id=actor.user_id
         )
+        db.add(entry)
+        db.flush()
+    # Deals gets the hash only, and the address comes off anything not sent to Deals yet.
+    from app.services import deals_optouts
+
+    deals_optouts.forgotten(db, email, entry.id, at)
     db.expire_all()
 
     for campaign in db.scalars(

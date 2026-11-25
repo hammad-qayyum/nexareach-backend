@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Table, func
+from sqlalchemy import CHAR, Column, Computed, DateTime, ForeignKey, Index, Integer, String, Table, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -55,6 +55,13 @@ class Lead(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     # Stored trimmed and lowercased. Not unique: the duplicates milestone adds "keep both".
     email: Mapped[str] = mapped_column(String(320), index=True)
+    # sha256(trimmed, lower-case email) as 64 hex characters: how Deals' do-not-email list names people.
+    # Worked out by the database, so it is always right and needs no backfill.
+    email_hash: Mapped[str] = mapped_column(
+        CHAR(64),
+        Computed("nexareach_email_hash(email)", persisted=True),
+        index=True,
+    )
     first_name: Mapped[str | None] = mapped_column(String(200))
     last_name: Mapped[str | None] = mapped_column(String(200))
     company: Mapped[str | None] = mapped_column(String(300))
@@ -66,6 +73,10 @@ class Lead(TimestampMixin, Base):
     email_provider: Mapped[EmailProvider | None] = mapped_column(str_enum(EmailProvider, "email_provider"))
     # Any other sheet columns, keyed by snake_case column name, usable as {{variables}}.
     custom: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
+    # Handed to Deals as a lead (step 4): never added to a campaign again; links to the lead in Deals.
+    handed_to_deals_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deals_lead_id: Mapped[str | None] = mapped_column(String(100))
+    deals_lead_url: Mapped[str | None] = mapped_column(Text)
 
     groups: Mapped[list[LeadGroup]] = relationship(secondary=lead_group_members, back_populates="leads")
 

@@ -533,3 +533,26 @@ def timezone_for(
         main, regions, cities = MULTI_ZONE[key]
         return regions.get(_norm(region)) or cities.get(_norm(city)) or main
     return None
+
+
+# "UK" is a common short form, but GB is the ISO 3166 code.
+_NOT_ISO = {"uk"}
+
+
+@lru_cache
+def _country_codes() -> dict[str, str]:
+    """Every known name of a country → its ISO 3166-1 alpha-2 code (taken from the two-letter name in its
+    row)."""
+    codes: dict[str, str] = {}
+    groups = [names for names, _ in _COUNTRIES] + [names for names, *_ in _MULTI]
+    for names in groups:
+        two = [n for n in names if len(n) == 2 and n.isalpha() and n not in _NOT_ISO]
+        if len(two) == 1:
+            for name in names:
+                codes[_norm(name)] = two[0].upper()
+    return codes
+
+
+def country_code(country: str | None) -> str:
+    """ISO 3166-1 alpha-2 ("GB") for a country written any known way ("United Kingdom", "UK", "gb"), or ""."""
+    return _country_codes().get(_norm(country), "") if country else ""

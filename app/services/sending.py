@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
 from app.models import (
+    EMAILED,
     Campaign,
     CampaignRecipient,
     CampaignStatus,
@@ -43,10 +44,10 @@ from app.models import (
     campaign_mailboxes,
     lead_group_members,
 )
-from app.services import delivery, mailer, pacing, placement, privacy, warmup
-from app.services.app_settings import business_fields
+from app.services import deals, delivery, mailer, pacing, placement, privacy, warmup
+from app.services.app_settings import business_fields, email_footer
 from app.services.audit import SYSTEM, Actor, log_activity
-from app.services.templates import compose, lead_fields
+from app.services.templates import add_footer, compose, compose_versioned, lead_fields
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,8 @@ INTERRUPTED_AFTER = timedelta(minutes=10)
 # wait for the following tick and become two minutes.
 TICK_SLACK = timedelta(seconds=5)
 MAX_FOLLOW_UPS = 5
+# People on Deals' do-not-email list are passed over within one send turn; after this many the turn ends.
+MAX_BLOCKED_PER_TURN = 25
 # The worker plans once a minute; each mailbox then sends at a random second of that minute (never all at
 # :00). A mailbox that's simply free gets a second in the first RANDOM_START_SECONDS.
 TICK = timedelta(seconds=60)
@@ -85,7 +88,7 @@ def sent_today(db: Session, mailbox_id: int, at: datetime) -> int:
         .select_from(CampaignRecipient)
         .where(
             CampaignRecipient.mailbox_id == mailbox_id,
-            CampaignRecipient.status == RecipientStatus.SENT,
+            CampaignRecipient.status.in_(EMAILED),
             CampaignRecipient.sent_at >= day_start,
         )
     )
@@ -134,7 +137,7 @@ def blocked_reason(db: Session, email: str, campaign_id: int, at: datetime) -> s
         select(
             exists().where(
                 CampaignRecipient.email == email,
-                CampaignRecipient.status == RecipientStatus.SENT,
+                CampaignRecipient.status.in_(EMAILED),
                 CampaignRecipient.sent_at >= since,
                 CampaignRecipient.campaign_id != campaign_id,
             )
@@ -153,8 +156,16 @@ def blocked_reason(db: Session, email: str, campaign_id: int, at: datetime) -> s
     return "contacted_recently" if recent else None
 
 
-def start(db: Session, campaign: Campaign, actor: Actor, at: datetime) -> dict[str, int]:
-    """Fix the recipient list and set the campaign running. The caller has checked it can start."""
+DealsCheck = Callable[[list[str]], dict[str, tuple[str, datetime | None]]]
+
+
+def start(
+    db: Session, campaign: Campaign, actor: Actor, at: datetime, deals_check: DealsCheck | None = None
+) -> dict[str, int]:
+    """Fix the recipient list and set the campaign running. The caller has checked it can start.
+
+    `deals_check` (when Deals' do-not-email list is switched on) gets every lead's hash and returns the
+    blocked ones; it may raise DealsError, before anything is saved."""
     group_ids = [g.id for g in campaign.groups]
     excluded = select(campaign_exclusions.c.lead_id).where(campaign_exclusions.c.campaign_id == campaign.id)
     leads = db.scalars(
@@ -164,6 +175,7 @@ def start(db: Session, campaign: Campaign, actor: Actor, at: datetime) -> dict[s
         .order_by(Lead.id)
         .distinct()
     ).all()
+    blocked = deals_check([lead.email_hash for lead in leads]) if deals_check is not None else {}
 
     dnc_emails = set(db.scalars(select(DoNotContact.value).where(DoNotContact.kind == DncKind.EMAIL)))
     dnc_domains = set(db.scalars(select(DoNotContact.value).where(DoNotContact.kind == DncKind.DOMAIN)))
@@ -171,7 +183,7 @@ def start(db: Session, campaign: Campaign, actor: Actor, at: datetime) -> dict[s
     recent = set(
         db.scalars(
             select(CampaignRecipient.email).where(
-                CampaignRecipient.status == RecipientStatus.SENT, CampaignRecipient.sent_at >= since
+                CampaignRecipient.status.in_(EMAILED), CampaignRecipient.sent_at >= since
             )
         )
     ) | set(
@@ -185,7 +197,24 @@ def start(db: Session, campaign: Campaign, actor: Actor, at: datetime) -> dict[s
     # One recipient per lead. Two leads may share an email when someone chose "keep both" for a
     # duplicate; each copy gets its own email, as the plan specifies.
     counts = {"waiting": 0, "skipped": 0}
+    if deals_check is not None:
+        counts["blocked_by_deals"] = 0
     for lead in leads:
+        block = blocked.get(lead.email_hash)
+        if block is None and lead.handed_to_deals_at is not None:
+            block = ("lead", None)  # handed to Deals by NexaReach: Deals' sales team has them now
+        if block is not None:
+            db.add(
+                CampaignRecipient(
+                    campaign_id=campaign.id,
+                    lead_id=lead.id,
+                    email=lead.email,
+                    status=RecipientStatus.BLOCKED_BY_DEALS,
+                    skip_reason=block[0][:50],
+                )
+            )
+            counts["blocked_by_deals"] = counts.get("blocked_by_deals", 0) + 1
+            continue
         reason = None
         if (
             lead.email in dnc_emails
@@ -469,10 +498,29 @@ def send_next(
     sent_warmup = warmup.send(db, mailbox, at, deliver, rng)
     if sent_warmup is not None:
         return sent_warmup
-    picked = _pick(db, mailbox, at)
-    if picked is None:
-        return "idle"
-    recipient, campaign, is_follow_up = picked
+    check_deals = deals.blocklist_enabled(db)
+    if check_deals and deals.campaigns_held(db, at):
+        # Fail closed: the copy of Deals' list is too old to trust. Warm-up (above) carries on.
+        return "deals_stale"
+    passed_over = 0
+    for _ in range(MAX_BLOCKED_PER_TURN):
+        picked = _pick(db, mailbox, at)
+        if picked is None:
+            if passed_over:
+                db.commit()
+            return "idle"
+        recipient, campaign, is_follow_up = picked
+        block = deals.block_for(db, recipient.email, at) if check_deals else None
+        if block is None and _handed_to_deals(db, recipient):
+            block = ("lead", None)
+        if block is None:
+            break
+        # Not committed yet: the mailbox stays locked for the rest of its turn.
+        _blocked_by_deals(db, recipient, campaign, is_follow_up, block, at)
+        passed_over += 1
+    else:
+        db.commit()
+        return "blocked_by_deals"
     if is_follow_up:
         return _send_follow_up(db, mailbox, recipient, campaign, at, deliver, rng)
 
@@ -485,7 +533,7 @@ def send_next(
         return "skipped"
 
     lead = db.get(Lead, recipient.lead_id)
-    subject, body, html = compose(
+    subject, body, html, version = compose_versioned(
         campaign.subject,
         campaign.body,
         {**business_fields(db), **lead_fields(lead)},
@@ -493,7 +541,12 @@ def send_next(
         rng,
         campaign.body_format,
     )
-    msg = mailer.build_message(mailbox, recipient.email, subject, body, html)
+    recipient.subject_version = version[:998]
+    footer = email_footer(db)
+    body, html = add_footer(body, html, footer)
+    msg = mailer.build_message(
+        mailbox, recipient.email, subject, body, html, list_unsubscribe=footer is not None
+    )
 
     # Record the attempt and move the mailbox's next free time *before* talking to the mail server,
     # and commit. If the process dies mid-send, the row stays SENDING (never silently WAITING again,
@@ -598,6 +651,8 @@ def _send_follow_up(
     _, body, _ = compose(
         "", steps[step - 1]["body"], {**business_fields(db), **lead_fields(lead)}, mailbox.display_name, rng
     )
+    footer = email_footer(db)
+    body, _ = add_footer(body, None, footer)
     subject = reply_subject(recipient.subject_sent)
     earlier = [
         recipient.message_id,
@@ -611,7 +666,9 @@ def _send_follow_up(
             .order_by(FollowUpEmail.step)
         ),
     ]
-    msg = mailer.build_message(mailbox, recipient.email, subject, body, thread=earlier)
+    msg = mailer.build_message(
+        mailbox, recipient.email, subject, body, thread=earlier, list_unsubscribe=footer is not None
+    )
 
     row = db.scalar(
         select(FollowUpEmail).where(FollowUpEmail.recipient_id == recipient.id, FollowUpEmail.step == step)
@@ -698,6 +755,44 @@ def _send_follow_up(
     if outcome == "sent" and mailbox.imap_host:
         _save_sent_copy(db, mailbox, row, msg)
     return f"follow_up_{outcome}"
+
+
+def _handed_to_deals(db: Session, recipient: CampaignRecipient) -> bool:
+    lead = db.get(Lead, recipient.lead_id) if recipient.lead_id else None
+    return lead is not None and lead.handed_to_deals_at is not None
+
+
+def _blocked_by_deals(
+    db: Session,
+    recipient: CampaignRecipient,
+    campaign: Campaign,
+    is_follow_up: bool,
+    block: tuple[str, datetime | None],
+    at: datetime,
+) -> None:
+    """Check 3: this person is on Deals' do-not-email list. Never emailed; someone already emailed keeps
+    SENT and only their follow-ups stop. The caller commits."""
+    reason, until = block
+    if is_follow_up:
+        stop_follow_ups(db, recipient, "blocked_by_deals")
+    else:
+        recipient.status = RecipientStatus.BLOCKED_BY_DEALS
+        recipient.skip_reason = reason[:50]
+        recipient.next_attempt_at = None
+    log_activity(
+        db,
+        SYSTEM,
+        "email.blocked_by_deals",
+        entity_type="lead",
+        entity_id=recipient.lead_id,
+        after={
+            "campaign_id": campaign.id,
+            "reason": reason,
+            "until": until.isoformat() if until else None,
+            "follow_up": is_follow_up,
+        },
+    )
+    _finish_if_done(db, campaign, at)
 
 
 def _mailbox_login_failed(db: Session, mailbox: Mailbox, e: Exception) -> None:
@@ -860,6 +955,8 @@ def plan_tick(
         recovered = recover_interrupted(db, start)
         if recovered:
             log.warning("marked %s interrupted send(s) as failed without resending", recovered)
+        # Opens (once) or closes the "Deals list out of date" alert; the sends themselves check too.
+        deals.check_stale(db, start)
         mailboxes = db.execute(
             select(Mailbox.id, Mailbox.next_send_at).where(Mailbox.status == MailboxStatus.ACTIVE)
         ).all()

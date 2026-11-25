@@ -1,15 +1,17 @@
 """Numbers for the Reports page: emails per day, per mailbox and per campaign."""
 
 from datetime import date, datetime, time, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, available_timezones
 
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, or_, select, union_all
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, CurrentActor, CurrentUser
 from app.models import (
+    EMAILED,
     Campaign,
     CampaignRecipient,
     CampaignStatus,
@@ -18,6 +20,9 @@ from app.models import (
     Mailbox,
     RecipientStatus,
 )
+from app.services import deals_reports
+from app.services.audit import log_activity
+from app.services.csv_export import csv_response
 from app.services.sending import now
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -86,10 +91,11 @@ def summary(
         CampaignRecipient.campaign_id.label("campaign_id"),
         CampaignRecipient.mailbox_id.label("mailbox_id"),
         CampaignRecipient.email.label("email"),
-        cast(CampaignRecipient.status, String).label("outcome"),
+        # Handed to Deals means the email was sent.
+        func.replace(cast(CampaignRecipient.status, String), "HANDED_TO_DEALS", "SENT").label("outcome"),
         func.coalesce(CampaignRecipient.sent_at, CampaignRecipient.updated_at).label("at"),
         literal(False).label("follow_up"),
-    ).where(CampaignRecipient.status.in_([RecipientStatus.SENT, RecipientStatus.FAILED]))
+    ).where(CampaignRecipient.status.in_([*EMAILED, RecipientStatus.FAILED]))
     follow_ups = (
         select(
             FollowUpEmail.campaign_id,
@@ -195,3 +201,101 @@ def summary(
             replied=replied,
         ),
     )
+
+
+# --- Deals: MQLs, pipeline and revenue (Deals integration step 5) ------------------------------------------
+
+
+class DealsReportRow(BaseModel):
+    key: str
+    label: str
+    emails_sent: int
+    mqls: int
+    auto: int
+    approved: int
+    manual: int
+    reached_proposal: int
+    won: int
+    won_usd: int
+    lost: int
+    lost_reasons: dict[str, int]
+    # Won value ÷ emails sent × 1,000 (campaign and follow-up emails). None when nothing was sent.
+    revenue_per_1000: float | None
+
+
+class DealsReportOut(BaseModel):
+    dimension: str
+    rows: list[DealsReportRow]
+    total: DealsReportRow
+
+
+Dimension = Literal["campaign", "mailbox", "version", "lead_list"]
+
+
+def _range(date_from: datetime | None, date_to: datetime | None) -> tuple[datetime, datetime]:
+    end = date_to or now()
+    return date_from or end - timedelta(days=30), end
+
+
+@router.get("/deals", response_model=DealsReportOut)
+def deals_report(
+    db: DB,
+    _: CurrentUser,
+    dimension: Dimension = "campaign",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> DealsReportOut:
+    start, end = _range(date_from, date_to)
+    return DealsReportOut(**deals_reports.compute(db, start, end, dimension))
+
+
+@router.get("/deals/export")
+def export_deals_report(
+    db: DB,
+    actor: CurrentActor,
+    _: CurrentUser,
+    dimension: Dimension = "campaign",
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> StreamingResponse:
+    start, end = _range(date_from, date_to)
+    report = deals_reports.compute(db, start, end, dimension)
+    log_activity(
+        db,
+        actor,
+        "reports.deals_exported",
+        after={"dimension": dimension, "from": start.isoformat(), "to": end.isoformat()},
+    )
+    db.commit()
+    header = [
+        dimension,
+        "emails sent",
+        "MQLs",
+        "auto",
+        "approved",
+        "manual",
+        "reached proposal",
+        "won",
+        "won USD",
+        "lost",
+        "lost reasons",
+        "revenue per 1000 emails",
+    ]
+    rows = [
+        [
+            r["label"],
+            r["emails_sent"],
+            r["mqls"],
+            r["auto"],
+            r["approved"],
+            r["manual"],
+            r["reached_proposal"],
+            r["won"],
+            r["won_usd"],
+            r["lost"],
+            "; ".join(f"{k}: {v}" for k, v in r["lost_reasons"].items()),
+            r["revenue_per_1000"],
+        ]
+        for r in [*report["rows"], report["total"]]
+    ]
+    return csv_response(f"deals-report-{dimension}.csv", header, rows)

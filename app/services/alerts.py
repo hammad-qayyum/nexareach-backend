@@ -1,5 +1,5 @@
 """Deliverability alerts (plan section 19): a banner in the app, an email to the admins, and for the serious
-ones a pause of the mailbox's campaign emails.
+ones (only when `Thresholds.auto_pause` is switched on) a pause of the mailbox's campaign emails.
 
 Each check reports what is wrong right now with sync(kind, conditions): a new problem opens an alert (and may
 pause mailboxes); a problem that is still there only refreshes its alert; an alert whose problem went away is
@@ -32,6 +32,10 @@ THRESHOLDS_KEY = "deliverability.thresholds"
 
 class Thresholds(BaseModel):
     """Editable in Settings (admins). Defaults from the plan."""
+
+    # Off (the default): serious problems only warn (banner and email). On: they also pause the mailbox's
+    # campaign emails until a person resumes them.
+    auto_pause: bool = False
 
     # More than this share of hard bounces in a mailbox's last `bounce_window` emails pauses it.
     hard_bounce_pct: float = Field(default=3.0, ge=0.5, le=50)
@@ -74,6 +78,11 @@ KINDS: dict[str, KindInfo] = {
     "helper_broken": KindInfo("Warm-up helper not working", AlertSeverity.WARNING, False),
     "cpanel_failing": KindInfo("cPanel delivery log not readable", AlertSeverity.WARNING, False),
     "dmarc_mailbox_failing": KindInfo("DMARC reports mailbox not readable", AlertSeverity.WARNING, False),
+    # Deals' do-not-email list (app.services.deals). A stale copy stops all campaign emails by itself (not
+    # per mailbox), and they start again by themselves after the next good sync.
+    "deals_stale": KindInfo("Deals do-not-email list out of date", AlertSeverity.CRITICAL, False),
+    "deals_signature": KindInfo("Deals rejected our signature", AlertSeverity.CRITICAL, False),
+    "deals_error": KindInfo("Deals sync problem", AlertSeverity.WARNING, False),
 }
 
 
@@ -123,6 +132,7 @@ def sync(
     commits.
     """
     info = KINDS[kind]
+    pausing = info.pauses and thresholds(db).auto_pause
     active = {(a.mailbox_id, a.target): a for a in _active(db, kind)}
     new: list[Alert] = []
     seen: set[tuple[int | None, str]] = set()
@@ -133,6 +143,19 @@ def sync(
         if alert is not None:
             alert.message = c.message[:1000]
             alert.last_seen_at = at
+            # Pausing was switched on while this problem was open: pause now (not if a person resumed).
+            if pausing and alert.status == AlertStatus.OPEN and not alert.paused_mailbox_ids:
+                paused = [mid for mid in dict.fromkeys(c.pause) if _pause(db, mid, kind, at)]
+                if paused:
+                    alert.paused_mailbox_ids = paused
+                    log_activity(
+                        db,
+                        SYSTEM,
+                        "alert.paused",
+                        entity_type="alert",
+                        entity_id=alert.id,
+                        after={"kind": kind, "paused_mailbox_ids": paused},
+                    )
             continue
         alert = Alert(
             kind=kind,
@@ -147,7 +170,7 @@ def sync(
         )
         db.add(alert)
         db.flush()
-        if info.pauses:
+        if pausing:
             alert.paused_mailbox_ids = [mid for mid in dict.fromkeys(c.pause) if _pause(db, mid, kind, at)]
         log_activity(
             db,
@@ -252,7 +275,8 @@ def _email_text(db: Session, alert: Alert) -> tuple[str, str]:
             "Fix the problem, then press Resume on the Deliverability page.",
             "",
         ]
-    lines += [f"Details: {get_settings().app_base_url.rstrip('/')}/deliverability", ""]
+    page = "settings/deals" if alert.kind.startswith("deals_") else "deliverability"
+    lines += [f"Details: {get_settings().app_base_url.rstrip('/')}/{page}", ""]
     return f"NexaReach alert: {title}", "\n".join(lines)
 
 

@@ -1,6 +1,7 @@
 from app.models.activity import ActivityLog
 from app.models.base import Base
 from app.models.campaign import (
+    EMAILED,
     BodyFormat,
     Campaign,
     CampaignRecipient,
@@ -11,6 +12,15 @@ from app.models.campaign import (
     campaign_exclusions,
     campaign_groups,
     campaign_mailboxes,
+)
+from app.models.deals import (
+    DealsBlock,
+    DealsHandover,
+    DealsLeadEvent,
+    DealsLeadResult,
+    DealsOptout,
+    DealsOptoutBatch,
+    DealsSyncState,
 )
 from app.models.deliverability import (
     Alert,
@@ -42,7 +52,7 @@ from app.models.lead import (
 )
 from app.models.mailbox import Mailbox, MailboxStatus, SmtpSecurity
 from app.models.quick_reply import QuickReply
-from app.models.reply import AnswerStatus, Reply, ReplyAnswer, ReplyKind
+from app.models.reply import AnswerStatus, Reply, ReplyAnswer, ReplyKind, ScoreRule
 from app.models.setting import Setting
 from app.models.user import LoginAttempt, Role, TokenPurpose, User, UserSession, UserStatus, UserToken
 from app.models.warmup import HelperProvider, LandedIn, WarmupHelper, WarmupMessage, WarmupStatus
@@ -51,6 +61,14 @@ __all__ = [
     "Alert",
     "AlertSeverity",
     "AlertStatus",
+    "EMAILED",
+    "DealsBlock",
+    "DealsHandover",
+    "DealsLeadEvent",
+    "DealsLeadResult",
+    "DealsOptout",
+    "DealsOptoutBatch",
+    "DealsSyncState",
     "DeliveryEvent",
     "DeliverySource",
     "DeliveryStatus",
@@ -89,6 +107,7 @@ __all__ = [
     "ReplyAnswer",
     "ReplyKind",
     "Role",
+    "ScoreRule",
     "Setting",
     "SmtpSecurity",
     "TokenPurpose",

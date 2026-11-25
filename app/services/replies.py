@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from email.header import decode_header, make_header
 from email.message import Message
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
 from app.models import (
+    EMAILED,
     AnswerStatus,
     CampaignRecipient,
     DeliverySource,
@@ -43,14 +44,15 @@ from app.models import (
     DoNotContact,
     FollowUpEmail,
     FollowUpStatus,
+    Lead,
     Mailbox,
     MailboxStatus,
-    RecipientStatus,
     Reply,
     ReplyAnswer,
     ReplyKind,
 )
-from app.services import delivery, mailer, sending, warmup
+from app.services import deals_optouts, delivery, mailer, sending, warmup
+from app.services.app_settings import email_footer
 from app.services.audit import SYSTEM, Actor, log_activity
 from app.services.email_html import to_text
 
@@ -117,7 +119,7 @@ def watched_for(db: Session, mailbox_id: int, at: datetime) -> Watched:
         )
         .where(
             CampaignRecipient.mailbox_id == mailbox_id,
-            CampaignRecipient.status == RecipientStatus.SENT,
+            CampaignRecipient.status.in_(EMAILED),
             CampaignRecipient.lead_id.is_not(None),
             CampaignRecipient.sent_at >= at - timedelta(days=WATCH_DAYS),
         )
@@ -159,6 +161,20 @@ def _is_auto_reply(msg: Message) -> bool:
     if _header(msg, "Precedence").strip().lower() in ("auto_reply", "bulk", "junk", "list"):
         return True
     return bool(_AUTO_SUBJECT.match(_header(msg, "Subject")))
+
+
+def _is_unsubscribe_subject(msg: Message) -> bool:
+    subject = " ".join(_header(msg, "Subject").lower().split())
+    while subject.startswith(("re:", "aw:", "fw:", "fwd:")):
+        subject = subject.split(":", 1)[1].strip()
+    return subject == "unsubscribe"
+
+
+def _is_complaint(msg: Message) -> bool:
+    """A spam-complaint report (ARF) a mail provider sends back when someone presses "Report spam"."""
+    return msg.get_content_type() == "multipart/report" and (
+        str(msg.get_param("report-type", "")).lower() == "feedback-report"
+    )
 
 
 def _is_bounce(msg: Message, sender: str) -> bool:
@@ -281,10 +297,15 @@ def _bounced_recipient(msg: Message, watched: Watched) -> int | None:
 
 
 def classify(msg: Message, watched: Watched, at: datetime) -> tuple[str, int] | None:
-    """("reply" | "opt_out" | "bounce", recipient id) for a message that concerns us, else None."""
+    """("reply" | "opt_out" | "bounce" | "complaint", recipient id) for a message that concerns us, else
+    None."""
     if any(warmup.is_warmup(_header(msg, h)) for h in ("Message-ID", "In-Reply-To", "References")):
         return None  # warm-up traffic between our mailboxes and the helpers
     sender = parseaddr(_header(msg, "From"))[1].lower()
+    if _is_complaint(msg):
+        # Like a bounce, the report quotes our email.
+        rid = _bounced_recipient(msg, watched)
+        return ("complaint", rid) if rid is not None else None
     if _is_bounce(msg, sender):
         rid = _bounced_recipient(msg, watched)
         return ("bounce", rid) if rid is not None else None
@@ -312,6 +333,39 @@ def _add_to_do_not_contact(db: Session, recipient: CampaignRecipient) -> None:
             entity_id=added,
             after={"reason": "reply", "campaign_id": recipient.campaign_id},
         )
+        deals_optouts.queue_value(db, added)
+
+
+def _complained(db: Session, recipient: CampaignRecipient) -> None:
+    """They reported our email as spam: no more emails, ever, and Deals is told."""
+    sending.stop_follow_ups(db, recipient, "complained")
+    recipient.follow_up_stop = "complained"
+    log_activity(
+        db,
+        SYSTEM,
+        "email.complained",
+        entity_type="lead",
+        entity_id=recipient.lead_id,
+        after={"campaign_id": recipient.campaign_id},
+    )
+    if not recipient.email or recipient.lead_id is None:
+        return
+    added = db.scalar(
+        insert(DoNotContact)
+        .values(value=recipient.email, kind=DncKind.EMAIL, reason=deals_optouts.COMPLAINT_REASON)
+        .on_conflict_do_nothing(index_elements=[DoNotContact.value])
+        .returning(DoNotContact.value)
+    )
+    if added:
+        log_activity(
+            db,
+            SYSTEM,
+            "dnc.added",
+            entity_type="dnc",
+            entity_id=added,
+            after={"reason": "complaint", "campaign_id": recipient.campaign_id},
+        )
+        deals_optouts.queue_value(db, added)
 
 
 def _message_id(msg: Message) -> str:
@@ -331,9 +385,16 @@ def process(
     if found is None:
         return None
     kind, rid = found
+    if kind == "reply" and _is_unsubscribe_subject(msg) and email_footer(db) is not None:
+        kind = "opt_out"  # the List-Unsubscribe button sends an email with this subject
     recipient = db.get(CampaignRecipient, rid, with_for_update=True)
     if recipient is None:
         return None
+    if kind == "complaint":
+        if recipient.follow_up_stop == "complained":
+            return None  # the same report again
+        _complained(db, recipient)
+        return kind, recipient.campaign_id
     if kind == "bounce":
         text, code, remote = bounce_details(msg)
         status = delivery.bounce_kind(text, code)
@@ -373,6 +434,7 @@ def process(
         message_id=message_id,
         references=" ".join(_MESSAGE_ID.findall(_header(msg, "References")))[-5000:] or None,
         received_at=received,
+        cc=[a.lower()[:320] for _, a in getaddresses([_header(msg, "Cc")]) if "@" in a][:50] or None,
     )
     db.add(reply)
     db.flush()
@@ -397,7 +459,22 @@ def process(
             "first_reply": first,
         },
     )
+    _score_and_hand_over(db, reply, recipient, kind, received)
     return kind, recipient.campaign_id
+
+
+def _score_and_hand_over(
+    db: Session, reply: Reply, recipient: CampaignRecipient, kind: str, at: datetime
+) -> None:
+    """Deals integration (steps 3 and 4), each off until switched on: score the reply; a later real reply from
+    someone already handed to Deals goes straight there as "repeat", whatever its score."""
+    from app.services import deals_handover, reply_scores  # these import modules that import this one
+
+    reply_scores.score(db, reply, at)
+    lead = db.get(Lead, recipient.lead_id) if recipient.lead_id else None
+    if kind == "reply" and lead is not None and lead.handed_to_deals_at and deals_handover.enabled(db):
+        reply.review_status = None
+        deals_handover.queue(db, reply, "repeat", at)
 
 
 def check_mailbox(
@@ -408,7 +485,7 @@ def check_mailbox(
     open_inbox: OpenInbox = mailer.Inbox,
 ) -> dict[str, int]:
     """Read new inbox messages for one mailbox and record replies, opt-outs and bounces. Commits."""
-    counts = {"messages": 0, "reply": 0, "opt_out": 0, "bounce": 0}
+    counts = {"messages": 0, "reply": 0, "opt_out": 0, "bounce": 0, "complaint": 0}
     mailbox = db.get(Mailbox, mailbox_id)
     if mailbox is None or not mailbox.imap_host or mailer.development_block(mailbox):
         return counts
@@ -444,8 +521,8 @@ def check_mailbox(
         if found is not None:
             counts[found[0]] += 1
             touched.add(found[1])
-            if found[0] == "bounce":
-                bounce_uids.append(item.uid)
+            if found[0] in ("bounce", "complaint"):
+                bounce_uids.append(item.uid)  # reports, not people: out of the inbox
 
     mailbox.inbox_uidvalidity = batch.uidvalidity
     mailbox.inbox_last_uid = last_uid
@@ -569,7 +646,7 @@ def check_all(read: ReadInbox = mailer.read_inbox, open_inbox: OpenInbox = maile
         try:
             with SessionLocal() as db:
                 counts = check_mailbox(db, mailbox_id, sending.now(), read, open_inbox)
-            if counts["reply"] or counts["opt_out"] or counts["bounce"]:
+            if counts["reply"] or counts["opt_out"] or counts["bounce"] or counts["complaint"]:
                 log.info("mailbox %s: %s", mailbox_id, counts)
         except Exception:
             # One broken mailbox must not stop the others.

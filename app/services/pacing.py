@@ -14,7 +14,7 @@ from sqlalchemy import func, or_, select, union_all, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.models import CampaignRecipient, FollowUpEmail, FollowUpStatus, Mailbox, RecipientStatus
+from app.models import EMAILED, CampaignRecipient, FollowUpEmail, FollowUpStatus, Mailbox, RecipientStatus
 from app.services.providers import KNOWN
 
 DOMAIN_SPACING_SECONDS = (60, 180)
@@ -93,7 +93,7 @@ def full_companies(db: Session, at: datetime) -> list[str]:
     since = at - COMPANY_WINDOW
     opening = select(email_domain(CampaignRecipient.email).label("domain")).where(
         or_(
-            (CampaignRecipient.status == RecipientStatus.SENT) & (CampaignRecipient.sent_at >= since),
+            CampaignRecipient.status.in_(EMAILED) & (CampaignRecipient.sent_at >= since),
             CampaignRecipient.status == RecipientStatus.SENDING,
         )
     )

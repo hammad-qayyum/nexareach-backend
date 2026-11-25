@@ -1,5 +1,7 @@
 """App settings stored in the settings table (key/value)."""
 
+from dataclasses import dataclass
+
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
@@ -51,3 +53,29 @@ def set_json(db: Session, key: str, value: dict, user_id: int | None, *, secret:
             index_elements=[Setting.key], set_={"value": value, "is_secret": secret, "updated_by_id": user_id}
         )
     )
+
+
+# --- The opt-out line and postal address on campaign emails (Deals integration step 2) ----------------------
+
+EMAIL_FOOTER_KEY = "email.footer"  # {"enabled", "optout_line"}
+DEFAULT_OPTOUT_LINE = "Not relevant? Reply 'stop' and we won't email you again."
+
+
+@dataclass(frozen=True)
+class EmailFooter:
+    optout_line: str
+    postal_address: str
+
+
+def email_footer_settings(db: Session) -> tuple[bool, str]:
+    cfg = get_json(db, EMAIL_FOOTER_KEY)
+    return bool(cfg.get("enabled")), (cfg.get("optout_line") or DEFAULT_OPTOUT_LINE)
+
+
+def email_footer(db: Session) -> EmailFooter | None:
+    """What goes under every campaign and follow-up email, or None while switched off (an email is then
+    exactly what was written). Never on warm-up, test-free app emails or answers to replies."""
+    enabled, line = email_footer_settings(db)
+    if not enabled:
+        return None
+    return EmailFooter(optout_line=line, postal_address=get_value(db, FOOTER_POSTAL_ADDRESS).strip())

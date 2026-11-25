@@ -26,6 +26,7 @@ from app.core.crypto import encrypt, generate_key
 from app.core.db import SessionLocal
 from app.core.security import MIN_PASSWORD_LENGTH, hash_password
 from app.models import (
+    EMAILED,
     CampaignRecipient,
     DncKind,
     DoNotContact,
@@ -34,7 +35,6 @@ from app.models import (
     LeadGroup,
     Mailbox,
     MailboxStatus,
-    RecipientStatus,
     Role,
     SmtpSecurity,
     User,
@@ -435,7 +435,7 @@ def apply_simulated_reply(db: Session, email: str, text: str) -> str:
     email = normalize_email(email)
     recipient = db.scalar(
         select(CampaignRecipient)
-        .where(CampaignRecipient.email == email, CampaignRecipient.status == RecipientStatus.SENT)
+        .where(CampaignRecipient.email == email, CampaignRecipient.status.in_(EMAILED))
         .order_by(CampaignRecipient.sent_at.desc())
         .limit(1)
     )
@@ -486,7 +486,7 @@ def apply_simulated_bounce(db: Session, email: str, soft: bool = False) -> str:
     email = normalize_email(email)
     recipient = db.scalar(
         select(CampaignRecipient)
-        .where(CampaignRecipient.email == email, CampaignRecipient.status == RecipientStatus.SENT)
+        .where(CampaignRecipient.email == email, CampaignRecipient.status.in_(EMAILED))
         .order_by(CampaignRecipient.sent_at.desc())
         .limit(1)
     )

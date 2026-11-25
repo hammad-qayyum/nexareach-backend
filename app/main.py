@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from app.api import (
     auth,
     campaigns,
+    deals,
     deliverability,
     dnc,
     duplicates,
@@ -16,6 +17,7 @@ from app.api import (
     quick_replies,
     replies,
     reports,
+    scoring,
     settings,
     users,
     warmup,
@@ -64,5 +66,8 @@ for router in (
     quick_replies.router,
     warmup.router,
     deliverability.router,
+    deals.settings_router,
+    deals.router,
+    scoring.router,
 ):
     app.include_router(router, prefix="/api")

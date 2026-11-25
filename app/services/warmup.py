@@ -61,6 +61,8 @@ MISSING_AFTER = timedelta(hours=3)
 GAP_SECONDS = (300, 600)
 HELPER_FOLDER = "Work"
 WARMUP_FOLDER = "Warmup"
+# Keep filing helper answers this long after a mailbox's last warm-up email.
+FILING_AFTER_OFF = timedelta(days=7)
 LOW_RATE = 0.5
 LOW_RATE_DAYS = 3
 MIN_RESULTS_PER_DAY = 2
@@ -588,11 +590,28 @@ def run_helpers() -> None:
             log.exception("warm-up failed for helper %s", helper_id)
 
 
+def filing_mailbox_ids(db: Session, at: datetime) -> list[int]:
+    """Mailboxes whose inbox may hold helper answers: warm-up is on, or it sent warm-up mail lately (answers
+    still coming in after it was switched off). Never one whose login fails: trying every 5 minutes with a
+    wrong password can get the server's IP blocked (cPanel's cPHulk)."""
+    recent = select(WarmupMessage.mailbox_id).where(WarmupMessage.sent_at >= at - FILING_AFTER_OFF)
+    return list(
+        db.scalars(
+            select(Mailbox.id)
+            .where(
+                Mailbox.imap_host.is_not(None),
+                Mailbox.archived_at.is_(None),
+                Mailbox.status != MailboxStatus.ERROR,
+                (Mailbox.warmup_enabled.is_(True)) | Mailbox.id.in_(recent),
+            )
+            .order_by(Mailbox.id)
+        )
+    )
+
+
 def run_filing() -> None:
     with SessionLocal() as db:
-        mailbox_ids = db.scalars(
-            select(Mailbox.id).where(Mailbox.imap_host.is_not(None), Mailbox.archived_at.is_(None))
-        ).all()
+        mailbox_ids = filing_mailbox_ids(db, datetime.now(UTC))
     for mailbox_id in mailbox_ids:
         try:
             with SessionLocal() as db:

@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import Page
 from app.models import DncKind, DoNotContact
-from app.services import privacy
+from app.services import deals_optouts, privacy
 from app.services.audit import log_activity
 from app.services.auth import normalize_email
 
@@ -108,6 +108,7 @@ def add_dnc(body: DncAddIn, db: DB, user: EditorUser, actor: CurrentActor) -> Dn
     ).all()
     for value in added:
         log_activity(db, actor, "dnc.added", entity_type="dnc", entity_id=value, after={"reason": reason})
+        deals_optouts.queue_value(db, value)  # shared with Deals as "manual" (addresses only)
     db.commit()
     return DncAddOut(added=len(added), already_listed=len(parsed) - len(added), invalid=invalid[:200])
 
