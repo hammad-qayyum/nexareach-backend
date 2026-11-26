@@ -51,7 +51,7 @@ from app.models import (
     ReplyAnswer,
     ReplyKind,
 )
-from app.services import deals_optouts, delivery, mailer, sending, warmup
+from app.services import deals_optouts, delivery, mailer, scoring, sending, warmup
 from app.services.app_settings import email_footer
 from app.services.audit import SYSTEM, Actor, log_activity
 from app.services.email_html import to_text
@@ -216,11 +216,23 @@ def _reply_text(msg: Message) -> str:
     return _strip_quote(_full_text(msg)[0])
 
 
-def _strip_quote(text: str) -> str:
+def _strip_quote(text: str, sent: list[str] | None = None) -> str:
+    """What they wrote above the quoted earlier email. With `sent` (the emails we sent them), an answer
+    written below the quote is found too; without it that stays empty, so words from our own email (an
+    opt-out line, say) are never taken for theirs."""
     lines = [line for line in text.splitlines() if not line.lstrip().startswith(">")]
     text = "\n".join(lines)
     match = _QUOTE_START.search(text)
-    return (text[: match.start()] if match else text).strip()
+    above = (text[: match.start()] if match else text).strip()
+    if above or match is None or not sent:
+        return above
+    return scoring.extract_new_text(text[match.start() :], sent)
+
+
+def _sent_bodies(db: Session, recipient_id: int) -> list[str]:
+    from app.services import reply_scores  # reply_scores' callers import this module
+
+    return reply_scores.sent_bodies(db, recipient_id)
 
 
 def _date(msg: Message, fallback: datetime) -> datetime:
@@ -390,6 +402,9 @@ def process(
     recipient = db.get(CampaignRecipient, rid, with_for_update=True)
     if recipient is None:
         return None
+    sent = _sent_bodies(db, recipient.id)
+    if kind == "reply" and _OPT_OUT.search(_strip_quote(_full_text(msg)[0], sent)):
+        kind = "opt_out"  # "unsubscribe" written below the quoted email
     if kind == "complaint":
         if recipient.follow_up_stop == "complained":
             return None  # the same report again
@@ -428,7 +443,7 @@ def process(
         from_email=address.lower()[:320],
         from_name=name.strip()[:200] or None,
         subject=_header(msg, "Subject").strip()[:998],
-        text=_strip_quote(full_text)[:MAX_TEXT],
+        text=_strip_quote(full_text, sent)[:MAX_TEXT],
         full_text=full_text.strip()[:MAX_TEXT],
         has_attachments=attachments,
         message_id=message_id,

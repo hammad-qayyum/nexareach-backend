@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Reply, ReplyKind, ScoreRule
+from app.models import Campaign, CampaignRecipient, FollowUpEmail, Reply, ReplyKind, ScoreRule
 from app.services import scoring
 from app.services.app_settings import get_json
 from app.services.audit import SYSTEM, log_activity
@@ -89,6 +89,30 @@ def _opt_out_result(db: Session) -> scoring.ScoreResult:
     return scoring.ScoreResult(value=0, matched=[name or "Asked not to be emailed"], hard_stop="no")
 
 
+def sent_bodies(db: Session, recipient_id: int | None) -> list[str]:
+    """The emails we sent this person (opening email and follow-ups), to recognise them quoted in a reply."""
+    if recipient_id is None:
+        return []
+    opening = db.scalar(select(CampaignRecipient.body_sent).where(CampaignRecipient.id == recipient_id))
+    follow_ups = db.scalars(
+        select(FollowUpEmail.body_sent).where(
+            FollowUpEmail.recipient_id == recipient_id, FollowUpEmail.body_sent.is_not(None)
+        )
+    ).all()
+    return [b for b in (opening, *follow_ups) if b]
+
+
+def recent_templates(db: Session, limit: int = 20) -> list[str]:
+    """The Try it box has no email behind it: the recent campaigns' texts stand in for what we sent."""
+    texts: list[str] = []
+    for body, follow_ups in db.execute(
+        select(Campaign.body, Campaign.follow_ups).order_by(Campaign.id.desc()).limit(limit)
+    ):
+        texts.append(body or "")
+        texts += [str(f.get("body") or "") for f in follow_ups or [] if isinstance(f, dict)]
+    return [t for t in texts if t]
+
+
 def score(db: Session, reply: Reply, at: datetime, *, review: bool = True) -> str | None:
     """Score a reply and save it; returns its band (None while scoring is off). `review`: new replies join
     the review list or are handed over; replies scored afterwards for display don't. The caller commits."""
@@ -104,6 +128,7 @@ def score(db: Session, reply: Reply, at: datetime, *, review: bool = True) -> st
             list(reply.cc or []),
             rules(db),
             set(s.free_mail_domains),
+            sent_bodies(db, reply.recipient_id),
         )
     band = band_for(result, s)
     reply.score, reply.score_rules, reply.score_band = result.value, result.matched, band
@@ -131,13 +156,14 @@ def score(db: Session, reply: Reply, at: datetime, *, review: bool = True) -> st
 def try_text(db: Session, text: str, sender: str, cc: list[str]) -> dict[str, Any]:
     """The Try it box: score a pasted reply with the current rules. Nothing is saved."""
     s = settings(db)
-    result = scoring.score_reply(text, sender, cc, rules(db), set(s.free_mail_domains))
+    sent = recent_templates(db)
+    result = scoring.score_reply(text, sender, cc, rules(db), set(s.free_mail_domains), sent)
     return {
         "score": result.value,
         "matched": result.matched,
         "hard_stop": result.hard_stop,
         "band": band_for(result, s),
-        "new_text": scoring.extract_new_text(text),
+        "new_text": scoring.extract_new_text(text, sent),
     }
 
 

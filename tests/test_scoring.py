@@ -192,6 +192,38 @@ def test_only_the_new_words_count(text, new):
     assert extract_new_text(text) == new
 
 
+OUR_EMAIL = (
+    "Hi Ahmad,\n\nI was looking at PixelForge Labs and other Web Development companies in Lahore, and had a "
+    "quick idea for https://pixelforge.example.\n\nWould you be open to a 15-minute call next week? I can "
+    "show you a short demo.\n\nBest regards,\nZamna Razzaq\nFastNexa"
+)
+
+
+def test_an_answer_below_the_quote_counts():
+    """Bottom-posting (as Roundcube allows): nothing above the quote, the answer under it."""
+    quoted = "\n".join("> " + line for line in OUR_EMAIL.split("\n"))
+    text = f"On 2026-11-26 03:49, Zamna Razzaq wrote:\n{quoted}\n\nYes, I am interested.\n\nThanks,\nAhmad"
+    assert extract_new_text(text) == "Yes, I am interested."
+    # Only a quote, no answer: nothing.
+    assert extract_new_text(f"On Tue, Zamna wrote:\n{quoted}") == ""
+
+
+def test_an_answer_below_an_unmarked_quote_counts_once_our_email_is_known():
+    """An HTML reply turned into text: the quote is only indented (and re-wrapped), not marked with ">"."""
+    wrapped = OUR_EMAIL.replace("companies in Lahore", "companies in\nLahore")
+    quoted = "\n".join("  " + line for line in wrapped.split("\n"))
+    text = (
+        f"On 2026-11-26 03:49, Zamna Razzaq wrote:\n{quoted}\n\n"
+        "Yes, I am interested. Yes, I am available for a meeting."
+    )
+    assert extract_new_text(text, [OUR_EMAIL]) == "Yes, I am interested. Yes, I am available for a meeting."
+    result = score_reply(text, ACME, [], RULES, FREE, [OUR_EMAIL])
+    assert result.matched == ["Clear interest", "Wants a meeting", "Company email"] and result.value == 80
+    # Our own "call … next week?" never counts: without the answer the reply scores only the sender.
+    only_quote = f"On 2026-11-26 03:49, Zamna Razzaq wrote:\n{quoted}"
+    assert score_reply(only_quote, ACME, [], RULES, FREE, [OUR_EMAIL]).matched == ["Company email"]
+
+
 def test_quoted_words_from_our_email_dont_raise_the_score():
     text = "Not for us.\n\nOn Tue, Ali wrote:\n> Can we book a call to discuss pricing?"
     assert score_reply(text, GMAIL, [], RULES, FREE).value == 0

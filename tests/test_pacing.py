@@ -88,9 +88,13 @@ def test_a_company_gets_at_most_two_emails_a_day(client, admin, db, smtp):
         "f@gmail.com",
     }
     assert sending.send_next(db, mailbox, at, smtp) == "idle"
+    # The campaign page says who waits and until when: 24 hours after the first bluehub email.
+    first = db.scalar(select(CampaignRecipient.sent_at).where(CampaignRecipient.email == "a@bluehub.com"))
+    assert pacing.company_holds(db, campaign_id, at) == [("bluehub.com", 1, first + timedelta(days=1))]
     # 24 hours after the first bluehub email, the third person gets theirs.
     assert sending.send_next(db, mailbox, T + timedelta(days=1, minutes=1), smtp) == "sent"
     assert "c@bluehub.com" in _sent_to(db, campaign_id)
+    assert pacing.company_holds(db, campaign_id, T + timedelta(days=1, minutes=1)) == []
 
 
 def test_follow_ups_count_towards_the_company_limit(client, admin, db, smtp):

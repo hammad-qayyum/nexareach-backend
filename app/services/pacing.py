@@ -114,6 +114,52 @@ def full_companies(db: Session, at: datetime) -> list[str]:
     return [d for d in rows if d and d not in FREE_MAIL]
 
 
+def company_holds(db: Session, campaign_id: int, at: datetime) -> list[tuple[str, int, datetime]]:
+    """This campaign's waiting people at companies that reached today's limit: (company domain, how many are
+    waiting, when the next email to that company may go)."""
+    full = full_companies(db, at)
+    if not full:
+        return []
+    domain = email_domain(CampaignRecipient.email)
+    waiting = db.execute(
+        select(domain, func.count())
+        .where(
+            CampaignRecipient.campaign_id == campaign_id,
+            CampaignRecipient.status == RecipientStatus.WAITING,
+            domain.in_(full),
+        )
+        .group_by(domain)
+        .order_by(domain)
+    ).all()
+    holds = []
+    since = at - COMPANY_WINDOW
+    for company, count in waiting:
+        opening = select(func.coalesce(CampaignRecipient.sent_at, at).label("at")).where(
+            email_domain(CampaignRecipient.email) == company,
+            or_(
+                CampaignRecipient.status.in_(EMAILED) & (CampaignRecipient.sent_at >= since),
+                CampaignRecipient.status == RecipientStatus.SENDING,
+            ),
+        )
+        follow_ups = (
+            select(func.coalesce(FollowUpEmail.sent_at, at).label("at"))
+            .join(CampaignRecipient, FollowUpEmail.recipient_id == CampaignRecipient.id)
+            .where(
+                email_domain(CampaignRecipient.email) == company,
+                or_(
+                    (FollowUpEmail.status == FollowUpStatus.SENT) & (FollowUpEmail.sent_at >= since),
+                    FollowUpEmail.status == FollowUpStatus.SENDING,
+                ),
+            )
+        )
+        times = sorted(db.scalars(select(union_all(opening, follow_ups).subquery().c.at)).all())
+        # The company is free again once enough of these emails are more than a day old.
+        enough = len(times) >= COMPANY_DAILY_LIMIT
+        free_at = times[len(times) - COMPANY_DAILY_LIMIT] + COMPANY_WINDOW if enough else at
+        holds.append((company, count, free_at))
+    return holds
+
+
 def not_full(full: list[str]) -> list[ColumnElement]:
     """Conditions for a recipient query: skip people at companies that reached today's limit."""
     return [email_domain(CampaignRecipient.email).not_in(full)] if full else []

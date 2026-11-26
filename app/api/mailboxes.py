@@ -1,3 +1,5 @@
+import time
+from collections.abc import Callable
 from datetime import date, datetime
 
 from fastapi import APIRouter, HTTPException, status
@@ -22,6 +24,9 @@ from app.services.auth import normalize_email
 from app.services.sending import now, sent_today
 
 router = APIRouter(prefix="/mailboxes", tags=["mailboxes"])
+
+# Between the two tries of a connection test (a server slow to answer often isn't the next time).
+RETRY_PAUSE_SECONDS = 3
 
 # Never include the password.
 AUDIT_FIELDS = [
@@ -360,19 +365,33 @@ def check_mailbox(mailbox_id: int, db: DB, _: EditorUser, actor: CurrentActor) -
     return _test_and_set_status(db, _get(db, mailbox_id), actor)
 
 
+def _once_more_if_temporary[T](check: Callable[[Mailbox], T], mailbox: Mailbox) -> tuple[T, bool]:
+    """Run a connection check; if it fails for a passing reason (timeout, dropped connection, "try later"),
+    wait a moment and run it once more. Returns (result, whether it took the second try). A rejected password
+    is never retried: each extra failed login brings cPanel's brute-force block (cPHulk) closer."""
+    try:
+        return check(mailbox), False
+    except (mailer.SendFailed, mailer.SentCopyFailed) as e:
+        if not e.temporary:
+            raise
+    time.sleep(RETRY_PAUSE_SECONDS)
+    return check(mailbox), True
+
+
 def _test_and_set_status(db: DB, mailbox: Mailbox, actor: CurrentActor) -> CheckOut:
     """Test the connection and set the status from the result: a mailbox is only ACTIVE while its login
-    works. Commits."""
+    works. A slow or dropped connection gets one more try first. Commits."""
     try:
-        mailer.check_login(mailbox)
-        result = CheckOut(ok=True, detail="Signed in to the SMTP server.")
+        _, retried = _once_more_if_temporary(mailer.check_login, mailbox)
+        tries = " on the second try." if retried else "."
+        result = CheckOut(ok=True, detail=f"Signed in to the SMTP server{tries}")
     except mailer.AuthFailed as e:
         result = CheckOut(ok=False, detail=f"The server rejected the username or password ({e}).")
     except mailer.SendFailed as e:
         result = CheckOut(ok=False, detail=str(e))
     if result.ok and mailbox.imap_host:
         try:
-            mailbox.sent_folder = mailer.check_imap(mailbox)
+            mailbox.sent_folder, _ = _once_more_if_temporary(mailer.check_imap, mailbox)
             result.detail += f' Sent copies go to the "{mailbox.sent_folder}" folder.'
         except mailer.SentCopyFailed as e:
             # Sending works, so the mailbox is usable; only the Sent copy is affected.

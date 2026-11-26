@@ -1,7 +1,7 @@
 import logging
 import random
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from zoneinfo import available_timezones
 
@@ -38,7 +38,7 @@ from app.models import (
     campaign_exclusions,
     lead_group_members,
 )
-from app.services import deals, mailer, replies, sending
+from app.services import deals, mailer, pacing, replies, sending
 from app.services.app_settings import BUSINESS_FIELDS, business_fields, email_footer
 from app.services.audit import changes, log_activity, snapshot
 from app.services.csv_export import csv_response
@@ -209,6 +209,15 @@ class Counts(BaseModel):
     hard_bounced: int = 0
 
 
+class CompanyHold(BaseModel):
+    """Waiting people at a company that already got its emails for the day (pacing.COMPANY_DAILY_LIMIT)."""
+
+    domain: str
+    waiting: int
+    limit: int
+    free_at: datetime
+
+
 class CampaignOut(BaseModel):
     id: int
     name: str
@@ -234,6 +243,8 @@ class CampaignOut(BaseModel):
     finished_at: datetime | None
     created_at: datetime
     counts: Counts
+    # Only on a running or paused campaign's own page, and left out while empty.
+    company_holds: list[CompanyHold] = Field(default_factory=list, exclude_if=lambda v: not v)
 
 
 class FollowUpOut(BaseModel):
@@ -394,7 +405,13 @@ def _excluded(db: DB, campaign_ids: list[int]) -> dict[int, int]:
 
 
 def _full(db: DB, c: Campaign) -> "CampaignOut":
-    return _out(c, _counts(db, [c.id])[c.id], _excluded(db, [c.id]).get(c.id, 0))
+    out = _out(c, _counts(db, [c.id])[c.id], _excluded(db, [c.id]).get(c.id, 0))
+    if c.status in (CampaignStatus.RUNNING, CampaignStatus.PAUSED) and out.counts.waiting:
+        out.company_holds = [
+            CompanyHold(domain=d, waiting=n, limit=pacing.COMPANY_DAILY_LIMIT, free_at=free)
+            for d, n, free in pacing.company_holds(db, c.id, datetime.now(UTC))
+        ]
+    return out
 
 
 def _out(c: Campaign, counts: Counts, excluded: int = 0) -> CampaignOut:
