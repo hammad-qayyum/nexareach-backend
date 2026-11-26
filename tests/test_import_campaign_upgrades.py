@@ -43,7 +43,7 @@ def test_import_sets_timezone_and_provider(client, admin):
     leads = _leads(client, result["group"]["id"])
     assert leads["sara@acme-google.com"]["timezone"] == "Asia/Dubai"
     assert leads["omar@globex-microsoft.com"]["timezone"] == "Asia/Karachi"
-    assert leads["lee@initech.com"]["timezone"] is None  # USA has several zones
+    assert leads["lee@initech.com"]["timezone"] == "America/New_York"  # USA, no state: the main zone
     assert leads["nina@hooli.com"]["timezone"] == "America/New_York"  # timezone column wins
     assert leads["zoe@gmail.com"]["email_provider"] == "GOOGLE"
     assert leads["omar@globex-microsoft.com"]["email_provider"] == "MICROSOFT"

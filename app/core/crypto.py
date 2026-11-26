@@ -6,6 +6,7 @@ Stored format: "v1:" + base64(nonce || ciphertext). The version prefix leaves ro
 import base64
 import os
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.core.config import get_settings
@@ -29,11 +30,18 @@ def encrypt(plaintext: str) -> str:
     return _PREFIX + base64.b64encode(nonce + ciphertext).decode()
 
 
+class WrongKey(ValueError):
+    """The value was encrypted with a different ENCRYPTION_KEY (the key changed since it was saved)."""
+
+
 def decrypt(token: str) -> str:
     if not token.startswith(_PREFIX):
         raise ValueError("Unknown ciphertext version")
     blob = base64.b64decode(token[len(_PREFIX) :])
-    return AESGCM(_key()).decrypt(blob[:12], blob[12:], None).decode()
+    try:
+        return AESGCM(_key()).decrypt(blob[:12], blob[12:], None).decode()
+    except InvalidTag as e:
+        raise WrongKey("Saved with a different ENCRYPTION_KEY; it can't be read with the current one.") from e
 
 
 def generate_key() -> str:

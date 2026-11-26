@@ -23,6 +23,7 @@ class ForgetOut(BaseModel):
     campaigns: int
     campaign_emails: int
     duplicate_rows: int
+    replies: int = 0
 
 
 @router.post("/export")

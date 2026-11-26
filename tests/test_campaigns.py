@@ -140,6 +140,13 @@ def test_start_skips_do_not_contact(client, ready):
         "failed": 0,
         "skipped": 1,
         "cancelled": 0,
+        "follow_ups_sent": 0,
+        "follow_ups_planned": 0,
+        "replied": 0,
+        "opted_out": 0,
+        "bounced": 0,
+        "delivered": 0,
+        "hard_bounced": 0,
     }
 
 
@@ -292,3 +299,22 @@ def test_development_copy_only_sends_through_mailpit(client, ready, monkeypatch)
     assert r.status_code == 400 and r.json()["detail"] == "dev_real_mailbox"
     r = client.post(f"/api/campaigns/{ready['campaign']['id']}/test-send", json={"to": "me@example.com"})
     assert r.json()["ok"] is False and "only sends through Mailpit" in r.json()["detail"]
+
+
+def test_a_three_minute_gap_sends_every_three_minutes(client, ready, db, smtp):
+    """The gap starts a moment after the tick, so the tick 3 minutes later must still count as due."""
+    campaign_id = ready["campaign"]["id"]
+    mailbox_id = ready["mailbox"]["id"]
+    r = client.patch(f"/api/campaigns/{campaign_id}", json={"gap_min_seconds": 180, "gap_max_seconds": 180})
+    assert r.status_code == 200, r.text
+    client.post(f"/api/campaigns/{campaign_id}/start")
+    tick = TUESDAY_11AM_PKT
+    assert sending.send_next(db, mailbox_id, tick + timedelta(seconds=0.7), smtp) == "sent"
+    assert sending.send_next(db, mailbox_id, tick + timedelta(seconds=120), smtp) == "not_due"
+    assert sending.send_next(db, mailbox_id, tick + timedelta(seconds=180.2), smtp) == "sent"
+
+
+def test_gap_under_three_minutes_is_refused(client, ready):
+    campaign_id = ready["campaign"]["id"]
+    r = client.patch(f"/api/campaigns/{campaign_id}", json={"gap_min_seconds": 60, "gap_max_seconds": 120})
+    assert r.status_code == 422

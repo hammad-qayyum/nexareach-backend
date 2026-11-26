@@ -10,6 +10,9 @@ os.environ["ENCRYPTION_KEY"] = base64.b64encode(b"k" * 32).decode()
 os.environ["APP_BASE_URL"] = "http://testserver"
 # Not "development": tests use fake mail servers on made-up hosts.
 os.environ["APP_ENV"] = "test"
+# Environment variables win over .env, so a laptop's development settings don't leak into tests.
+os.environ["SMTP_ALLOW_PLAIN"] = "false"
+os.environ["SENTRY_DSN"] = ""
 
 from collections.abc import Iterator  # noqa: E402
 
@@ -121,7 +124,8 @@ def admin(make_user, login):
 
 @pytest.fixture(autouse=True)
 def fake_dns(monkeypatch):
-    """No real DNS in tests: domains with "google"/"microsoft" in them are hosted there, others elsewhere."""
+    """No real DNS in tests: domains with "google"/"microsoft" in them are hosted there, "ownmail" ones on
+    their own server, "nomail" ones nowhere, others at some other host."""
     from app.services import providers
 
     def mx_hosts(domain: str) -> list[str]:
@@ -131,7 +135,9 @@ def fake_dns(monkeypatch):
             return ["aspmx.l.google.com"]
         if "microsoft" in domain:
             return [f"{domain.replace('.', '-')}.mail.protection.outlook.com"]
-        return [f"mail.{domain}"]
+        if "ownmail" in domain:
+            return [f"mail.{domain}"]
+        return [f"mx.{domain}.mailhost.net"]
 
     monkeypatch.setattr(providers, "mx_hosts", mx_hosts)
 
@@ -145,3 +151,34 @@ def fake_mail_login(monkeypatch):
     monkeypatch.setattr(mailer, "real_check_imap", mailer.check_imap, raising=False)
     monkeypatch.setattr(mailer, "check_login", lambda mailbox: None)
     monkeypatch.setattr(mailer, "check_imap", lambda mailbox: "INBOX.Sent")
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Nothing in a test may reach another computer (the test database is local). Above all no real mail
+    server: a login with a test password could get this computer blocked by it. Mail code sees the refusal
+    as a connection problem (the send or Sent copy fails) unless a test fakes the server."""
+    import socket
+
+    real = socket.getaddrinfo
+
+    def local_only(host, *args, **kwargs):
+        if host not in (None, "localhost", "127.0.0.1", "::1", "testserver"):
+            raise OSError(f"tests don't reach the network ({host})")
+        return real(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", local_only)
+
+
+@pytest.fixture(autouse=True)
+def no_dns(monkeypatch):
+    """dnspython talks to DNS servers by IP, past the getaddrinfo guard: refuse every lookup instead.
+    Health-check tests pass their own fake lookup."""
+    import dns.exception
+    import dns.resolver
+
+    def refuse(self, *args, **kwargs):
+        raise dns.exception.DNSException("tests don't reach DNS")
+
+    monkeypatch.setattr(dns.resolver.Resolver, "resolve", refuse)
+    monkeypatch.setattr(dns.resolver.Resolver, "resolve_name", refuse)

@@ -6,7 +6,7 @@ from app.api.groups import CUSTOM_KEY, LeadOut, lead_out
 from app.models import Lead
 from app.services.audit import changes, log_activity
 from app.services.duplicates import lead_snapshot
-from app.services.geo import timezone_for, valid_timezone
+from app.services.geo import region_and_city, timezone_for, valid_timezone
 from app.services.templates import FIXED_FIELDS
 
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -36,15 +36,18 @@ def update_lead(lead_id: int, body: LeadUpdateIn, db: DB, _: EditorUser, actor: 
         raise HTTPException(status.HTTP_404_NOT_FOUND, "lead_not_found")
     sent = body.model_fields_set
     before = lead_snapshot(lead)
+    # The timezone the old country gave (to tell a guessed timezone from one someone set on purpose).
+    guessed = timezone_for(None, lead.country, *region_and_city(lead.custom))
     for field in ("first_name", "last_name", "company", "country"):
         if field in sent:
             setattr(lead, field, _clean(getattr(body, field)))
     if "timezone" in sent:
         if body.timezone and not valid_timezone(body.timezone):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_timezone")
-        lead.timezone = timezone_for(body.timezone, lead.country)
-    elif "country" in sent and lead.timezone is None:
-        lead.timezone = timezone_for(None, lead.country)
+        lead.timezone = timezone_for(body.timezone, lead.country, *region_and_city(lead.custom))
+    elif "country" in sent and (lead.timezone is None or lead.timezone == guessed):
+        # A timezone that came from the country follows the new country; one set by hand stays.
+        lead.timezone = timezone_for(None, lead.country, *region_and_city(lead.custom))
     if body.custom is not None:
         lead.custom = {
             k: v.strip()[:1000]

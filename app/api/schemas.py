@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from app.models import Role, UserStatus
+from app.models import DeliverySource, DeliveryStatus, Role, UserStatus
 
 
 class UserOut(BaseModel):
@@ -39,3 +39,20 @@ class ActivityLogOut(BaseModel):
 class Page[T](BaseModel):
     items: list[T]
     total: int
+
+
+class DeliveryEventOut(BaseModel):
+    """One line of the mail-server log (send, cPanel delivery log, or a bounce email)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    occurred_at: datetime
+    source: DeliverySource
+    status: DeliveryStatus
+    email: str
+    remote_host: str | None
+    response: str | None
+    queue_id: str | None
+    recipient_id: int | None
+    follow_up_id: int | None

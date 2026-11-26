@@ -65,6 +65,24 @@ def variables_used(*texts: str) -> set[str]:
     return {m.group(1) for t in texts for m in VARIABLE.finditer(t)}
 
 
+def add_footer(text: str, html_body: str | None, footer: Any) -> tuple[str, str | None]:
+    """The opt-out line as the last line, then the postal address in small print (Settings → Emails).
+    `footer`: app_settings.EmailFooter, or None to leave the email exactly as written."""
+    if footer is None:
+        return text, html_body
+    lines = [footer.optout_line.strip()]
+    if footer.postal_address:
+        lines.append(footer.postal_address)
+    new_text = text.rstrip() + "\n\n" + "\n\n".join(lines) + "\n"
+    if html_body is None:
+        return new_text, None
+    extra = f"<p>{html.escape(footer.optout_line.strip())}</p>"
+    if footer.postal_address:
+        address = "<br>".join(html.escape(part) for part in footer.postal_address.splitlines())
+        extra += f'<p style="font-size:12px;color:#6b7280">{address}</p>'
+    return new_text, html_body + extra
+
+
 def compose(
     subject: str,
     body: str,
@@ -73,6 +91,18 @@ def compose(
     rng: random.Random,
     body_format: str = "TEXT",
 ) -> tuple[str, str, str | None]:
+    subject_out, text, html_body, _ = compose_versioned(subject, body, fields, sender_name, rng, body_format)
+    return subject_out, text, html_body
+
+
+def compose_versioned(
+    subject: str,
+    body: str,
+    fields: dict[str, Any],
+    sender_name: str,
+    rng: random.Random,
+    body_format: str = "TEXT",
+) -> tuple[str, str, str | None, str]:
     """The final subject, plain-text body and (for rich-text campaigns) HTML body for one recipient.
 
     Spintax is resolved once, so the HTML and plain-text versions say exactly the same thing. Nothing is
@@ -80,9 +110,11 @@ def compose(
     ({{business_name}} and {{postal_address}} come from Settings).
     """
     fields = {"sender_name": sender_name, **fields}
-    rendered_subject = " ".join(render(subject, fields, rng).split())
+    # The subject after spintax but before names are filled in is the email's "version" in reports.
+    version = " ".join(spin(subject, rng).split())
+    rendered_subject = " ".join(fill(version, fields).split())
     if body_format != "HTML":
-        return rendered_subject, f"{render(body, fields, rng).rstrip()}\n", None
+        return rendered_subject, f"{render(body, fields, rng).rstrip()}\n", None, version
 
     body_html = fill(spin(sanitize(body), rng), fields, escape=True)
-    return rendered_subject, f"{to_text(body_html)}\n", body_html
+    return rendered_subject, f"{to_text(body_html)}\n", body_html, version

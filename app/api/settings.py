@@ -1,9 +1,20 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
-from app.services.app_settings import FOOTER_BUSINESS_NAME, FOOTER_POSTAL_ADDRESS, get_footer, set_value
+from app.api.deps import DB, AdminUser, CurrentActor, CurrentUser, EditorUser
+from app.models import Mailbox
+from app.services.app_settings import (
+    EMAIL_FOOTER_KEY,
+    FOOTER_BUSINESS_NAME,
+    FOOTER_POSTAL_ADDRESS,
+    email_footer_settings,
+    get_footer,
+    get_value,
+    set_json,
+    set_value,
+)
 from app.services.audit import changes, log_activity
+from app.services.invites import INVITE_MAILBOX, invite_mailbox
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -31,3 +42,73 @@ def update_footer(body: FooterSettings, db: DB, user: EditorUser, actor: Current
         log_activity(db, actor, "settings.footer_updated", entity_type="settings", before=old, after=new)
         db.commit()
     return FooterSettings(**after)
+
+
+class InviteSettings(BaseModel):
+    # The mailbox that emails invite links. None: the admin sends the link themselves.
+    mailbox_id: int | None = None
+
+
+@router.get("/invites", response_model=InviteSettings)
+def read_invite_settings(db: DB, _: CurrentUser) -> InviteSettings:
+    mailbox = invite_mailbox(db)
+    return InviteSettings(mailbox_id=mailbox.id if mailbox else None)
+
+
+@router.put("/invites", response_model=InviteSettings)
+def update_invite_settings(
+    body: InviteSettings, db: DB, admin: AdminUser, actor: CurrentActor
+) -> InviteSettings:
+    if body.mailbox_id is not None:
+        mailbox = db.get(Mailbox, body.mailbox_id)
+        if mailbox is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "mailbox_not_found")
+        if mailbox.archived_at is not None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "mailbox_archived")
+    before = get_value(db, INVITE_MAILBOX) or None
+    after = str(body.mailbox_id) if body.mailbox_id is not None else None
+    if before != after:
+        set_value(db, INVITE_MAILBOX, after or "", admin.id)
+        log_activity(
+            db,
+            actor,
+            "settings.invites_updated",
+            entity_type="settings",
+            before={"mailbox_id": before},
+            after={"mailbox_id": after},
+        )
+        db.commit()
+    return InviteSettings(mailbox_id=body.mailbox_id)
+
+
+class EmailFooterSettings(BaseModel):
+    # On: every campaign and follow-up email ends with the opt-out line and the postal address (from the
+    # business details), and carries a List-Unsubscribe header. Off: an email is exactly what was written.
+    enabled: bool
+    optout_line: str = Field(min_length=5, max_length=300)
+
+
+@router.get("/email-footer", response_model=EmailFooterSettings)
+def read_email_footer(db: DB, _: CurrentUser) -> EmailFooterSettings:
+    enabled, line = email_footer_settings(db)
+    return EmailFooterSettings(enabled=enabled, optout_line=line)
+
+
+@router.put("/email-footer", response_model=EmailFooterSettings)
+def update_email_footer(
+    body: EmailFooterSettings, db: DB, user: EditorUser, actor: CurrentActor
+) -> EmailFooterSettings:
+    line = " ".join(body.optout_line.split())
+    if body.enabled and not get_value(db, FOOTER_POSTAL_ADDRESS).strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "postal_address_required")
+    enabled, old_line = email_footer_settings(db)
+    before = {"enabled": enabled, "optout_line": old_line}
+    after = {"enabled": body.enabled, "optout_line": line}
+    if before != after:
+        set_json(db, EMAIL_FOOTER_KEY, after, user.id)
+        old, new = changes(before, after)
+        log_activity(
+            db, actor, "settings.email_footer_updated", entity_type="settings", before=old, after=new
+        )
+        db.commit()
+    return EmailFooterSettings(**after)

@@ -1,16 +1,17 @@
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from email_validator import EmailNotValidError, validate_email
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, func, or_, select
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.api.deps import DB, CurrentActor, CurrentUser, EditorUser
 from app.api.schemas import Page
 from app.models import (
+    DealsBlock,
     DuplicateStatus,
     EmailProvider,
     Lead,
@@ -19,10 +20,10 @@ from app.models import (
     campaign_groups,
     lead_group_members,
 )
-from app.services import privacy, sheets
+from app.services import deals, privacy, sheets
 from app.services.audit import changes, log_activity
 from app.services.auth import normalize_email
-from app.services.geo import timezone_for
+from app.services.geo import region_and_city, timezone_for
 from app.services.providers import detect, detect_many, domain_of
 from app.services.templates import FIXED_FIELDS
 
@@ -44,6 +45,15 @@ class GroupOut(BaseModel):
     created_at: datetime
 
 
+class DealsBlockOut(BaseModel):
+    """On Deals' do-not-email list: never added to a campaign."""
+
+    # lead, client, lost, meta_lead, opted_out, bounced, complained or forgotten.
+    reason: str
+    # For "lost": the day they may be emailed again.
+    until: datetime | None
+
+
 class LeadOut(BaseModel):
     id: int
     email: str
@@ -55,6 +65,11 @@ class LeadOut(BaseModel):
     email_provider: EmailProvider | None
     custom: dict[str, Any]
     created_at: datetime
+    # Set only while Deals' do-not-email list is switched on and this person is on it.
+    deals_block: DealsBlockOut | None = None
+    # Handed to Deals as a lead by NexaReach (never added to a campaign again), with the link to it.
+    handed_to_deals_at: datetime | None = None
+    deals_lead_url: str | None = None
 
 
 class LeadRowIn(BaseModel):
@@ -87,6 +102,8 @@ class ImportOut(BaseModel):
     invalid: list[InvalidRow]
     # How many of the added leads use each email provider ("GOOGLE": 12, …).
     provider_mix: dict[str, int]
+    # Added leads on Deals' do-not-email list (None while that check is switched off).
+    blocked_by_deals: int | None = None
 
 
 class GroupUpdateIn(BaseModel):
@@ -102,6 +119,16 @@ class FacetCount(BaseModel):
 class FacetsOut(BaseModel):
     providers: list[FacetCount]
     countries: list[FacetCount]
+    # Every extra-field name used by a lead in the group, A to Z (for the table's columns).
+    custom_keys: list[str]
+    # Leads on Deals' do-not-email list (None while that check is switched off).
+    deals_blocked: int | None = None
+
+
+class RecheckOut(BaseModel):
+    checked: int
+    changed: int
+    provider_mix: dict[str, int]
 
 
 class AddLeadOut(BaseModel):
@@ -119,7 +146,7 @@ class SheetOut(BaseModel):
     csv: str
 
 
-def lead_out(lead: Lead) -> LeadOut:
+def lead_out(lead: Lead, block: tuple[str, datetime | None] | None = None) -> LeadOut:
     return LeadOut(
         id=lead.id,
         email=lead.email,
@@ -131,6 +158,16 @@ def lead_out(lead: Lead) -> LeadOut:
         email_provider=lead.email_provider,
         custom=lead.custom or {},
         created_at=lead.created_at,
+        deals_block=DealsBlockOut(reason=block[0], until=block[1]) if block else None,
+        handed_to_deals_at=lead.handed_to_deals_at,
+        deals_lead_url=lead.deals_lead_url,
+    )
+
+
+def _deals_blocked(at: datetime) -> Any:
+    """Leads on Deals' do-not-email list right now (check 1, worked out live so it never goes stale)."""
+    return exists().where(
+        DealsBlock.hash == Lead.email_hash, or_(DealsBlock.until.is_(None), DealsBlock.until > at)
     )
 
 
@@ -199,6 +236,8 @@ def list_group_leads(
     q: str | None = None,
     provider: EmailProvider | None = None,
     country: str | None = None,
+    # True: only people on Deals' do-not-email list; False: only the others.
+    deals_blocked: bool | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> Page[LeadOut]:
@@ -222,10 +261,15 @@ def list_group_leads(
         query = query.where(Lead.email_provider == provider)
     if country:
         query = query.where(func.lower(Lead.country) == country.strip().lower())
+    check = deals.blocklist_enabled(db)
+    at = datetime.now(UTC)
+    if check and deals_blocked is not None:
+        query = query.where(_deals_blocked(at) if deals_blocked else ~_deals_blocked(at))
     total = db.scalar(select(func.count()).select_from(query.subquery()))
-    leads = db.scalars(query.order_by(Lead.id).limit(limit).offset(offset))
+    leads = db.scalars(query.order_by(Lead.id).limit(limit).offset(offset)).all()
+    blocks = deals.active_blocks(db, [lead.email_hash for lead in leads], at) if check else {}
     return Page(
-        items=[lead_out(lead) for lead in leads],
+        items=[lead_out(lead, blocks.get(lead.email_hash)) for lead in leads],
         total=total,
     )
 
@@ -320,7 +364,15 @@ def import_group(body: ImportIn, db: DB, user: EditorUser, actor: CurrentActor) 
     mix: dict[str, int] = {}
     for lead in created.values():
         mix[lead.email_provider.value] = mix.get(lead.email_provider.value, 0) + 1
-    result = {"added": len(created), "pending_duplicates": len(duplicates), "invalid_count": invalid_count}
+    result: dict[str, Any] = {
+        "added": len(created),
+        "pending_duplicates": len(duplicates),
+        "invalid_count": invalid_count,
+    }
+    if deals.blocklist_enabled(db):
+        # Check 1: they stay in the group, marked, and Start leaves them out.
+        blocks = deals.active_blocks(db, [lead.email_hash for lead in created.values()], datetime.now(UTC))
+        result["blocked_by_deals"] = sum(1 for lead in created.values() if lead.email_hash in blocks)
     log_activity(
         db,
         actor,
@@ -347,7 +399,7 @@ def _fields(row: LeadRowIn) -> dict[str, Any]:
         "last_name": _clean(row.last_name),
         "company": _clean(row.company),
         "country": country,
-        "timezone": timezone_for(row.timezone, country),
+        "timezone": timezone_for(row.timezone, country, *region_and_city(custom)),
         "custom": custom,
     }
 
@@ -402,10 +454,56 @@ def group_facets(group_id: int, db: DB, _: CurrentUser) -> FacetsOut:
         .group_by(Lead.country)
         .order_by(func.count().desc(), Lead.country)
     )
+    custom_keys = sorted(
+        db.scalars(select(func.jsonb_object_keys(Lead.custom)).where(Lead.id.in_(members)).distinct())
+    )
+    blocked = None
+    if deals.blocklist_enabled(db):
+        at = datetime.now(UTC)
+        blocked = db.scalar(
+            select(func.count()).select_from(Lead).where(Lead.id.in_(members), _deals_blocked(at))
+        )
     return FacetsOut(
         providers=[FacetCount(value=(p.value if p else "PENDING"), count=n) for p, n in providers],
         countries=[FacetCount(value=c, count=n) for c, n in countries],
+        custom_keys=list(custom_keys),
+        deals_blocked=blocked,
     )
+
+
+@router.post("/{group_id}/recheck-providers", response_model=RecheckOut)
+def recheck_providers(group_id: int, db: DB, _: EditorUser, actor: CurrentActor) -> RecheckOut:
+    """Look up the email provider of every lead in the group again (each domain once).
+
+    For leads imported before a provider was known by name, or whose company has moved its email.
+    """
+    _get(db, group_id)
+    members = select(lead_group_members.c.lead_id).where(lead_group_members.c.group_id == group_id)
+    leads = db.execute(select(Lead.id, Lead.email, Lead.email_provider).where(Lead.id.in_(members))).all()
+    found = detect_many(domain_of(email) for _, email, _ in leads)
+    moves: dict[EmailProvider, list[int]] = {}
+    mix: dict[str, int] = {}
+    for lead_id, email, old in leads:
+        new = found[domain_of(email)]
+        mix[new.value] = mix.get(new.value, 0) + 1
+        if new != old:
+            moves.setdefault(new, []).append(lead_id)
+    for provider, ids in moves.items():
+        for start in range(0, len(ids), 1000):
+            db.execute(
+                update(Lead).where(Lead.id.in_(ids[start : start + 1000])).values(email_provider=provider)
+            )
+    changed = sum(len(ids) for ids in moves.values())
+    log_activity(
+        db,
+        actor,
+        "group.providers_rechecked",
+        entity_type="group",
+        entity_id=group_id,
+        after={"checked": len(leads), "changed": changed},
+    )
+    db.commit()
+    return RecheckOut(checked=len(leads), changed=changed, provider_mix=mix)
 
 
 @router.post("/{group_id}/leads", response_model=AddLeadOut, status_code=status.HTTP_201_CREATED)

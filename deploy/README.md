@@ -57,6 +57,8 @@ Open `https://<your domain>`, sign in and set up 2-step sign-in.
 
 To change someone's sign-in email or password later (for example a forgotten password), run the same
 command with `change-login` instead of `create-admin`. It signs them out everywhere and keeps their 2-step sign-in.
+If an admin loses their phone and no other admin can reset it on the Users page, run the same command
+with `reset-2fa <their email>`: they set up 2-step sign-in again at their next sign-in.
 
 ## 5. Backups
 

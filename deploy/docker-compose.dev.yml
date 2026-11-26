@@ -29,6 +29,28 @@ services:
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"
+    volumes:
+      - ./dev/mailpit-relay.yml:/etc/mailpit-relay.yml:ro
+    # Warm-up emails to the test helpers also go on to GreenMail, so the helpers really receive them
+    # (helpers' answers to sender1/2@example.com go on too, so warm-up filing can be tried).
+    command: ["--smtp-relay-config", "/etc/mailpit-relay.yml", "--smtp-relay-matching", "@(warmup\\.)?example\\.com$"]
+    depends_on:
+      - greenmail
+
+  greenmail:
+    # Test mail server with real inboxes (IMAP), for trying warm-up on this computer. Nothing leaves it.
+    # Helper accounts helper1/2/3@warmup.example.com, and the dev mailboxes' own inboxes (sender1/2@example.com),
+    # password "mailpit" (any new address is accepted too). SMTP 3025, IMAP 3143 (no encryption: local only).
+    image: greenmail/standalone:2.1.2
+    restart: unless-stopped
+    environment:
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users.login=email -Dgreenmail.auth.disabled
+        -Dgreenmail.users=helper1:mailpit@warmup.example.com,helper2:mailpit@warmup.example.com,helper3:mailpit@warmup.example.com,sender1:mailpit@example.com,sender2:mailpit@example.com
+    ports:
+      - "127.0.0.1:3025:3025"
+      - "127.0.0.1:3143:3143"
 
 volumes:
   dev-db:

@@ -1,12 +1,13 @@
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Environment configuration. Values come from env vars or the repo-root .env file."""
+    """Environment configuration. Values come from env vars or the .env file in this folder."""
 
-    model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "postgresql+psycopg://fastnexa:fastnexa@localhost:5433/fastnexa_outreach"
 
@@ -40,6 +41,11 @@ class Settings(BaseSettings):
         return self.app_env.strip().lower() == "development"
 
     @property
+    def is_test_copy(self) -> bool:
+        """Development or staging: a copy for trying things out, never the live site."""
+        return self.app_env.strip().lower() in ("development", "staging")
+
+    @property
     def queue_conninfo(self) -> str:
         """Plain libpq URL for Procrastinate (no SQLAlchemy driver suffix)."""
         return self.database_url.replace("postgresql+psycopg://", "postgresql://", 1)
@@ -47,4 +53,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # NEXAREACH_ENV_FILE picks another settings file, e.g. .env.staging for the staging copy on a laptop.
+    return Settings(_env_file=os.environ.get("NEXAREACH_ENV_FILE", ".env"))

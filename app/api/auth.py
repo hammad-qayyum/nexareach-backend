@@ -1,3 +1,4 @@
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -7,7 +8,7 @@ from sqlalchemy import select
 from app.api.deps import DB, SESSION_COOKIE, CurrentSession, anonymous_actor, client_ip, user_agent
 from app.api.schemas import UserOut
 from app.core.config import get_settings
-from app.core.crypto import decrypt, encrypt
+from app.core.crypto import WrongKey, decrypt, encrypt
 from app.core.security import (
     MIN_PASSWORD_LENGTH,
     hash_password,
@@ -19,6 +20,8 @@ from app.core.security import (
 from app.models import User, UserSession, UserStatus
 from app.services import auth as auth_service
 from app.services.audit import Actor, log_activity
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -215,7 +218,14 @@ def _check_totp(db: DB, request: Request, user: User, code: str) -> None:
     ip = client_ip(request)
     if auth_service.is_rate_limited(db, user.email, ip):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too_many_attempts")
-    step = verify_totp(decrypt(user.totp_secret_encrypted), code, user.totp_last_used_step)
+    try:
+        secret = decrypt(user.totp_secret_encrypted)
+    except WrongKey as e:
+        # The 2FA secret was saved under another ENCRYPTION_KEY: no code can ever match. An admin resets it
+        # (Users page, or `python -m app.cli reset-2fa` for the last admin) and the person sets it up again.
+        log.error("2FA secret of user %s can't be read: %s", user.id, e)
+        raise HTTPException(status.HTTP_409_CONFLICT, "mfa_secret_unreadable") from e
+    step = verify_totp(secret, code, user.totp_last_used_step)
     if step is None:
         auth_service.record_attempt(db, user.email, ip, "TOTP", success=False)
         log_activity(db, _user_actor(request, user), "auth.2fa_failed", entity_type="user", entity_id=user.id)

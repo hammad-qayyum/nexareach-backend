@@ -1,0 +1,9 @@
+# Mailpit passes mail for the test helpers (@warmup.example.com) and the dev mailboxes (@example.com) on to
+# GreenMail, which keeps real
+# inboxes on this computer. Everything still shows in Mailpit too. Development only.
+host: greenmail
+port: 3025
+starttls: false
+tls: false
+allow-insecure: true
+auth: none
