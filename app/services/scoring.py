@@ -6,15 +6,18 @@ database, no network, the same reply always gets the same score.
 
 1. Keep only the new words (`extract_new_text`): quoted lines, everything from a reply header ("On … wrote:",
    "-----Original Message-----", "From: … Sent:", and the Spanish, French and German forms) and the signature
-   are removed, so words from our own email ("call", "meeting") don't count.
+   are removed, so words from our own email ("call", "meeting") don't count. Someone who answers *below* the
+   quoted email (bottom-posting) leaves nothing above it: then the words after the quote count, with our own
+   email taken off (lines starting with ">", or the copy of what we sent, found word by word).
 2. Lower-case and collapse whitespace.
 3. Each rule that matches counts once: whole words or phrases, an admin's regex (with a time limit), or a
    built-in signal (question_mark, phone_or_time, company_domain, colleague_cc).
 4. Add the points and keep the total between 0 and 100. A matching hard-stop rule makes it 0.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
 import regex
 
@@ -70,15 +73,22 @@ _SIGN_OFF = regex.compile(
 )
 
 
-def extract_new_text(text: str) -> str:
-    """What the person wrote in this reply, without quoted history or their signature."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    cut = len(text)
-    for pattern in (_REPLY_HEADER, _OUTLOOK_HEADER):
-        found = pattern.search(text)
-        if found:
-            cut = min(cut, found.start())
-    lines = [line for line in text[:cut].split("\n") if not line.lstrip().startswith(">")]
+_WORD = regex.compile(r"\w+", regex.UNICODE)
+# Share of an email we sent that must be found, in order, for a stretch of the reply to count as its copy.
+QUOTE_SHARE = 0.6
+
+
+def _quote_header(text: str) -> regex.Match | None:
+    """Where the quoted earlier email starts (the earliest reply header), or None."""
+    found = [m for m in (p.search(text) for p in (_REPLY_HEADER, _OUTLOOK_HEADER)) if m]
+    return min(found, key=lambda m: m.start()) if found else None
+
+
+def _without_quoted_lines(text: str) -> list[str]:
+    return [line for line in text.split("\n") if not line.lstrip().startswith(">")]
+
+
+def _without_signature(lines: list[str]) -> str:
     # A signature after the standard "-- " line.
     for i, line in enumerate(lines):
         if line.rstrip() == "--":
@@ -91,6 +101,41 @@ def extract_new_text(text: str) -> str:
             lines = lines[:i]
             break
     return "\n".join(lines).strip()
+
+
+def after_quoted_copy(text: str, sent: Sequence[str]) -> str:
+    """`text` without a leading copy of one of the emails we `sent` (the quote in a reply whose quoted lines
+    aren't marked with ">", e.g. an HTML reply turned into text). Matching is word by word and in order, so
+    re-wrapped lines and a missing word or two don't matter. Unchanged when no copy is found."""
+    words = list(_WORD.finditer(text))
+    lower = [w.group().lower() for w in words]
+    cut = 0
+    for body in sent:
+        ours = [w.lower() for w in _WORD.findall(body or "")]
+        if len(ours) < 5:
+            continue
+        blocks = [
+            b for b in SequenceMatcher(None, ours, lower, autojunk=False).get_matching_blocks() if b.size >= 3
+        ]
+        if not blocks or sum(b.size for b in blocks) < QUOTE_SHARE * len(ours):
+            continue
+        last = blocks[-1]
+        cut = max(cut, words[last.b + last.size - 1].end())
+    return text[cut:]
+
+
+def extract_new_text(text: str, sent: Sequence[str] = ()) -> str:
+    """What the person wrote in this reply, without quoted history or their signature. `sent`: the emails we
+    sent them, to recognise an unmarked quote when they answered below it."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    for _ in range(3):  # a quote inside a quote, each answered below
+        found = _quote_header(text)
+        new = _without_signature(_without_quoted_lines(text[: found.start()] if found else text))
+        if new or found is None:
+            return new
+        # Nothing above the quoted email: they answered below it.
+        text = after_quoted_copy("\n".join(_without_quoted_lines(text[found.end() :])), sent)
+    return ""
 
 
 def normalize(text: str) -> str:
@@ -155,10 +200,16 @@ def matches(rule: Rule, text: str, sender: str, cc: list[str], free_mail: set[st
 
 
 def score_reply(
-    text: str, sender: str, cc: list[str], rules: list[Rule], free_mail_domains: set[str]
+    text: str,
+    sender: str,
+    cc: list[str],
+    rules: list[Rule],
+    free_mail_domains: set[str],
+    sent: Sequence[str] = (),
 ) -> ScoreResult:
-    """The score of one reply. `text` is the whole plain-text reply; quoted history is removed here."""
-    cleaned = normalize(extract_new_text(text))
+    """The score of one reply. `text` is the whole plain-text reply; quoted history is removed here. `sent`:
+    the emails we sent this person (see `extract_new_text`)."""
+    cleaned = normalize(extract_new_text(text, sent))
     result = ScoreResult(value=0)
     total = 0
     for rule in rules:

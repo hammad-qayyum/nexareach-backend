@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
-from app.models import ActivityLog, Reply, Role
+from app.models import ActivityLog, CampaignRecipient, Reply, Role
 from app.services import mailer, replies, sending
 from tests.test_campaigns import TUESDAY_11AM_PKT, ready, smtp  # noqa: F401 (shared fixtures)
 from tests.test_follow_ups import FakeInbox, _message, _start_and_send_first, campaign  # noqa: F401
@@ -128,6 +128,38 @@ def test_the_same_message_is_stored_once(client, db, replied):
 def test_an_opt_out_reply_is_marked(client, db, smtp, campaign):
     _start_and_send_first(client, db, smtp, campaign)
     inbox = FakeInbox(_reply_from_sara(smtp.sent[0], body="Please remove me from your list."))
+    replies.check_mailbox(db, campaign["mailbox_id"], DAY2, inbox)
+    assert client.get("/api/replies").json()["items"][0]["kind"] == "OPT_OUT"
+
+
+def _bottom_posted(first, sent_text, answer, *, marked):
+    """A reply written under the quoted email (Roundcube, some phones)."""
+    lines = sent_text.splitlines()
+    quoted = "\r\n".join(("> " if marked else "  ") + line for line in lines)
+    return _message(
+        sender="Sara Ahmed <sara@acme.com>",
+        subject=f"Re: {first['Subject']}",
+        body=f"On 2026-11-26 03:49, Ali wrote:\r\n{quoted}\r\n\r\n{answer}",
+        headers=f"Message-ID: <bottom@acme.com>\r\nIn-Reply-To: {first['Message-ID']}\r\n",
+    )
+
+
+@pytest.mark.parametrize("marked", [True, False])
+def test_an_answer_below_the_quote_is_found(client, db, smtp, campaign, marked):
+    _start_and_send_first(client, db, smtp, campaign)
+    sent_text = db.scalar(select(CampaignRecipient.body_sent))
+    answer = "Yes, I am interested. Can we talk on Thursday?"
+    inbox = FakeInbox(_bottom_posted(smtp.sent[0], sent_text, answer, marked=marked))
+    replies.check_mailbox(db, campaign["mailbox_id"], DAY2, inbox)
+    item = client.get("/api/replies").json()["items"][0]
+    assert item["kind"] == "REPLY" and item["snippet"] == answer
+
+
+def test_unsubscribe_below_the_quote_is_an_opt_out(client, db, smtp, campaign):
+    _start_and_send_first(client, db, smtp, campaign)
+    sent_text = db.scalar(select(CampaignRecipient.body_sent))
+    answer = "Please remove me from your list."
+    inbox = FakeInbox(_bottom_posted(smtp.sent[0], sent_text, answer, marked=True))
     replies.check_mailbox(db, campaign["mailbox_id"], DAY2, inbox)
     assert client.get("/api/replies").json()["items"][0]["kind"] == "OPT_OUT"
 

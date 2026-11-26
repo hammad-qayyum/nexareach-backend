@@ -174,7 +174,10 @@ SENT_NAMES = ("INBOX.Sent", "Sent", "Sent Items", "Sent Messages", "INBOX.Sent I
 
 
 class SentCopyFailed(Exception):
-    pass
+    def __init__(self, message: str, *, temporary: bool = False):
+        super().__init__(message)
+        # The server was slow or the connection dropped (worth one more try), not wrong settings.
+        self.temporary = temporary
 
 
 def _imap_connection(host: str, port: int) -> imaplib.IMAP4:
@@ -229,7 +232,9 @@ def check_imap(mailbox: Mailbox) -> str:
     try:
         conn = _imap(mailbox)
     except (OSError, ssl.SSLError, imaplib.IMAP4.error) as e:
-        raise SentCopyFailed(f"Couldn't connect to the IMAP server ({e}).") from e
+        # A timeout or dropped connection may pass on a second try; a certificate or protocol error won't.
+        temporary = isinstance(e, OSError) and not isinstance(e, ssl.SSLError)
+        raise SentCopyFailed(f"Couldn't connect to the IMAP server ({e}).", temporary=temporary) from e
     try:
         return _find_sent_folder(conn)
     finally:
